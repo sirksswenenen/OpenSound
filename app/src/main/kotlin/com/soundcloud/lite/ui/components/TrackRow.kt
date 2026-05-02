@@ -104,6 +104,7 @@ private fun ProviderBadge(provider: Provider) {
     val (text, bg, fg) = when (provider) {
         Provider.AUDIUS -> Triple("AUDIUS", Color(0xFF7138B7), Color.White)
         Provider.YOUTUBE -> Triple("YT", Color(0xFFCC2222), Color.White)
+        Provider.SOUNDCLOUD -> Triple("SC", Color(0xFFFF5500), Color.White)
         Provider.UNKNOWN -> return
     }
     Text(

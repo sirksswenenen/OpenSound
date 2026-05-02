@@ -12,6 +12,7 @@ import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import com.soundcloud.lite.api.AudiusApi
 import com.soundcloud.lite.api.Provider
+import com.soundcloud.lite.api.SoundCloudApi
 import com.soundcloud.lite.api.TrackInfo
 import com.soundcloud.lite.api.YouTubeApi
 import kotlinx.coroutines.CoroutineScope
@@ -24,6 +25,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Wraps a Media3 ExoPlayer (running inside a foreground service) and
@@ -36,12 +38,27 @@ class PlayerManager(
     private val context: Context,
     private val audius: AudiusApi,
     private val youtube: YouTubeApi,
+    private val soundcloud: SoundCloudApi,
 ) {
 
-    private fun resolveStreamUrl(track: TrackInfo): String? = when (track.provider) {
-        Provider.AUDIUS -> if (track.providerId.isNotBlank()) audius.streamUrl(track.providerId) else null
-        Provider.YOUTUBE -> if (track.providerId.isNotBlank()) youtube.streamUrl(track.providerId) else null
-        Provider.UNKNOWN -> null
+    /** Resolves a track to a playable HTTP URL just-in-time. Some
+     *  providers (SoundCloud) need a network call to mint a fresh
+     *  CDN-signed URL, so this is a suspend function that always
+     *  runs on Dispatchers.IO. The result must be consumed quickly
+     *  by ExoPlayer because most signed URLs expire within an hour. */
+    private suspend fun resolveStreamUrl(track: TrackInfo): String? = withContext(Dispatchers.IO) {
+        when (track.provider) {
+            Provider.AUDIUS -> if (track.providerId.isNotBlank()) audius.streamUrl(track.providerId) else null
+            Provider.YOUTUBE -> if (track.providerId.isNotBlank()) youtube.streamUrl(track.providerId) else null
+            Provider.SOUNDCLOUD -> {
+                // Prefer the cached transcoding URL on the track (saved
+                // during search/import) so we skip a per-track resolve
+                // round-trip; fall back to a full lookup if absent.
+                val viaHint = track.streamHint?.let { soundcloud.resolveStreamUrl(it) }
+                viaHint ?: track.providerId.takeIf { it.isNotBlank() }?.let { soundcloud.streamUrl(it) }
+            }
+            Provider.UNKNOWN -> null
+        }
     }
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
