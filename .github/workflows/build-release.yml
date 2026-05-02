@@ -9,6 +9,8 @@ jobs:
   build:
     name: Assemble release APK
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create GitHub Releases
 
     steps:
       - name: Checkout repository
