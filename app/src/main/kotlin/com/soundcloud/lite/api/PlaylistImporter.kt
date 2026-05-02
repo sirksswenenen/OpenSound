@@ -211,8 +211,13 @@ class PlaylistImporter(
     }
 
     companion object {
+        // Note: Android's ICU regex engine treats unescaped `}` (and `{`)
+        // as the start of a quantifier and rejects them at compile time.
+        // The desktop JVM regex engine is more lenient, which is why this
+        // pattern compiled on the build host but crashed on device. We
+        // escape both braces explicitly.
         private val SC_JSONLD_RE = Regex(
-            """<script type="application/ld\+json">(\{.+?})</script>""",
+            """<script type="application/ld\+json">(\{.+?\})</script>""",
             RegexOption.DOT_MATCHES_ALL,
         )
         // Each track JSON-LD object (within the "track":[…] array). We're
@@ -220,7 +225,7 @@ class PlaylistImporter(
         // contain a "MusicRecording" type and let extractJsonString fish
         // out the fields by name.
         private val SC_TRACK_BLOCK_RE = Regex(
-            """\{[^{}]*?"@type"\s*:\s*"MusicRecording"[^{}]*?\}""",
+            """\{[^\{\}]*?"@type"\s*:\s*"MusicRecording"[^\{\}]*?\}""",
             RegexOption.DOT_MATCHES_ALL,
         )
         private val ISO_DURATION_RE = Regex(
