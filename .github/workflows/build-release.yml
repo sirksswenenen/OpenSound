@@ -3,7 +3,7 @@ name: Build & Sign Release APK
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:   # allow manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   build:
@@ -11,18 +11,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Java 17 (required by AGP 8.x) ───────────────────────────────
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # ── 3. Gradle cache (speeds up repeated runs) ───────────────────────
       - name: Cache Gradle packages
         uses: actions/cache@v4
         with:
@@ -32,29 +29,37 @@ jobs:
           key: gradle-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties') }}
           restore-keys: gradle-
 
-      # ── 4. Make gradlew executable ──────────────────────────────────────
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      # ── 5. Build signed release APK ─────────────────────────────────────
-      #  build.gradle.kts picks up sclite.keystore from the repo root with
-      #  the default password/alias — no extra flags needed.
-      - name: Build release APK
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+      # Decode the keystore from the GitHub Secret and write it to a temp file.
+      # The file lives only inside this runner — it is never committed anywhere.
+      - name: Decode keystore
+        run: |
+          echo "${{ secrets.RELEASE_KEYSTORE_B64 }}" | base64 --decode > /tmp/sclite.keystore
 
-      # ── 6. Rename APK to include version tag ───────────────────────────
+      - name: Build release APK
+        run: |
+          ./gradlew assembleRelease --no-daemon --stacktrace \
+            -PSCLITE_KEYSTORE=/tmp/sclite.keystore \
+            -PSCLITE_STOREPASS="${{ secrets.KEYSTORE_PASS }}" \
+            -PSCLITE_KEYALIAS="${{ secrets.KEY_ALIAS }}" \
+            -PSCLITE_KEYPASS="${{ secrets.KEY_PASS }}"
+
+      # Wipe the keystore from the runner immediately after signing
+      - name: Clean up keystore
+        if: always()
+        run: rm -f /tmp/sclite.keystore
+
       - name: Rename APK
         run: |
           APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
-          echo "APK_PATH=$APK" >> $GITHUB_ENV
-          # e.g. OpenSound-v0.4.1-release.apk
           VERSION=$(grep 'versionName' app/build.gradle.kts | grep -oP '"\K[^"]+' | head -1)
           NEW_NAME="OpenSound-v${VERSION}-release.apk"
           cp "$APK" "app/build/outputs/apk/release/$NEW_NAME"
           echo "APK_FINAL=app/build/outputs/apk/release/$NEW_NAME" >> $GITHUB_ENV
           echo "APK_NAME=$NEW_NAME" >> $GITHUB_ENV
 
-      # ── 7. Upload APK as workflow artifact (downloadable for 30 days) ───
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -62,7 +67,6 @@ jobs:
           path: ${{ env.APK_FINAL }}
           retention-days: 30
 
-      # ── 8. Create / update a GitHub Release on main push ───────────────
       - name: Create GitHub Release
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
@@ -71,14 +75,6 @@ jobs:
           name: "OpenSound build #${{ github.run_number }}"
           body: |
             Automated release from commit ${{ github.sha }}
-
-            **Changes in this build:**
-            - Queue shuffle button (tap again to restore order)
-            - Smooth spring animation on drag-reorder
-            - Auto-scroll when dragging to list edge
-            - Swipe-to-delete threshold raised to 65 %
-            - Delete icon background instead of "Remove" text
-            - SC→YouTube fallback with duration matching (fixes 30 s previews)
           files: ${{ env.APK_FINAL }}
           draft: false
           prerelease: false

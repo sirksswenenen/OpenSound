@@ -12,3 +12,8 @@ local.properties
 
 # Keep the keystore (debug-style) so the build works out of the box.
 # DO NOT commit production keystores to a public repo.
+-e 
+# Signing keystore — never commit, store in GitHub Secrets
+sclite.keystore
+*.keystore
+*.jks
