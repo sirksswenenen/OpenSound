@@ -10,10 +10,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
-        android:label="OpenSC"
-        android:icon="@android:drawable/ic_media_play"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="false"
-        android:supportsRtl="true"
         android:theme="@style/Theme.OpenSC"
         android:enableOnBackInvokedCallback="true"
         tools:targetApi="34">
@@ -29,6 +29,37 @@
             </intent-filter>
         </activity>
 
+        <!-- Alternate launcher icons. The Settings screen toggles which
+             alias is enabled at runtime via PackageManager. Only one is
+             ever enabled at a time. -->
+        <activity-alias
+            android:name="com.soundcloud.lite.IconCyan"
+            android:targetActivity=".MainActivity"
+            android:label="@string/app_name"
+            android:icon="@mipmap/ic_launcher_cyan"
+            android:roundIcon="@mipmap/ic_launcher_cyan_round"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name="com.soundcloud.lite.IconPurple"
+            android:targetActivity=".MainActivity"
+            android:label="@string/app_name"
+            android:icon="@mipmap/ic_launcher_purple"
+            android:roundIcon="@mipmap/ic_launcher_purple_round"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
         <service
             android:name=".player.PlaybackService"
             android:foregroundServiceType="mediaPlayback"
@@ -37,6 +68,5 @@
                 <action android:name="androidx.media3.session.MediaSessionService" />
             </intent-filter>
         </service>
-
     </application>
 </manifest>
