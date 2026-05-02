@@ -7,6 +7,7 @@ import com.soundcloud.lite.api.AlternativeSource
 import com.soundcloud.lite.api.AudiusApi
 import com.soundcloud.lite.api.PlaylistImporter
 import com.soundcloud.lite.api.Provider
+import com.soundcloud.lite.api.SoundCloudApi
 import com.soundcloud.lite.api.TrackInfo
 import com.soundcloud.lite.api.YouTubeApi
 import com.soundcloud.lite.api.iTunesApi
@@ -34,9 +35,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val audiusApi: AudiusApi = AudiusApi()
     val youTubeApi: YouTubeApi = YouTubeApi()
+    val soundCloudApi: SoundCloudApi = SoundCloudApi()
     val iTunes: iTunesApi = iTunesApi()
-    val playlistImporter: PlaylistImporter = PlaylistImporter(youTubeApi)
-    val playerManager: PlayerManager = PlayerManager(application, audiusApi, youTubeApi)
+    val playlistImporter: PlaylistImporter = PlaylistImporter(youTubeApi, soundCloudApi)
+    val playerManager: PlayerManager = PlayerManager(application, audiusApi, youTubeApi, soundCloudApi)
 
     /** Long id → opaque providerId. Lets screens keep using Long
      *  identifiers in NavHost arguments. Populated lazily as we
@@ -251,10 +253,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun playlistById(id: String): Playlist? = _playlists.value.firstOrNull { it.id == id }
 
-    /** Imports a playlist from a foreign-service URL. Tracks that don't
-     *  have a playable provider yet (e.g. SoundCloud-imported tracks)
-     *  are matched against YouTube as a best-effort, with iTunes used
-     *  to clean up the metadata. */
+    /** Imports a playlist from a foreign-service URL.
+     *
+     *  - SoundCloud playlists come back fully-resolved with native SC
+     *    streams; no further matching needed.
+     *  - YouTube playlists come back with YT streams.
+     *  - Anything else (e.g. an imagined Spotify importer in the
+     *    future) returns placeholder tracks that we then try to match
+     *    against YouTube and Audius (with iTunes-cleaned queries) so
+     *    that they have *something* playable. We constrain matches to
+     *    ±15% of the original duration to avoid Extended Mix
+     *    versions getting picked over the canonical track. */
     fun importPlaylistFromUrl(url: String) {
         if (_importInProgress.value) return
         _importInProgress.value = true
@@ -269,6 +278,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         _toast.value = "Import failed (${result.sourceName}): ${result.message}"
                     }
                     is PlaylistImporter.ImportResult.Success -> {
+                        // SoundCloud / YouTube come back already playable;
+                        // unplayable entries (region-locks, deleted videos)
+                        // are skipped over by [resolveImportedTracks] for
+                        // foreign sources only.
                         val resolvedTracks = withContext(Dispatchers.IO) { resolveImportedTracks(result.tracks) }
                         rememberProviderIds(resolvedTracks)
                         val pl = Playlist(
@@ -279,7 +292,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         )
                         _playlists.update { it + pl }
                         val matched = resolvedTracks.count { !it.isUnplayable }
-                        _toast.value = "Imported '${result.title}' (${matched}/${resolvedTracks.size} playable)"
+                        val msg = buildString {
+                            append("Imported '${result.title}' (${matched}/${resolvedTracks.size} playable)")
+                            result.warning?.let { append(". ").append(it) }
+                        }
+                        _toast.value = msg
                     }
                 }
             } catch (t: Throwable) {
@@ -290,21 +307,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** For each track that came in as an unplayable placeholder, search
-     *  YouTube/Audius for a playable equivalent. iTunes provides a
-     *  cleaner search query when available. */
+    /** For each placeholder track (unplayable + provider == UNKNOWN),
+     *  search YouTube/Audius for a duration-matched playable version.
+     *  Tracks that already have a native provider stream attached to
+     *  them are returned as-is. */
     private suspend fun resolveImportedTracks(tracks: List<TrackInfo>): List<TrackInfo> = coroutineScope {
         tracks.map { t ->
             async {
+                if (t.provider != Provider.UNKNOWN) return@async t
                 if (!t.isUnplayable) return@async t
                 val query = t.title.ifBlank { return@async t }
-                // 1) Try iTunes for canonical title+artist+art
                 val match = runCatching { iTunes.enrich(query) }.getOrNull()
                 val fullQuery = if (match != null) "${match.artist} ${match.title}" else query
-                // 2) Search YouTube for a playable version (then Audius as fallback)
-                val yt = runCatching { youTubeApi.search(fullQuery, limit = 1) }.getOrDefault(emptyList()).firstOrNull()
+                val targetMs = t.duration
+                fun durationOk(d: Long) =
+                    targetMs <= 0L || d <= 0L || kotlin.math.abs(d - targetMs) <= (targetMs * 15 / 100)
+                val yt = runCatching { youTubeApi.search(fullQuery, limit = 5) }.getOrDefault(emptyList())
+                    .firstOrNull { durationOk(it.duration) }
                 val playable = yt ?: runCatching {
-                    audiusApi.search(fullQuery, limit = 1).tracks.firstOrNull()
+                    audiusApi.search(fullQuery, limit = 5).tracks.firstOrNull { durationOk(it.duration) }
                 }.getOrNull()
                 if (playable != null) {
                     playable.copy(
@@ -314,8 +335,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         genre = match?.genre ?: playable.genre,
                     )
                 } else {
-                    // No match anywhere — keep the placeholder, but at
-                    // least show clean metadata if iTunes had something.
                     t.copy(
                         title = match?.title ?: t.title,
                         artistName = match?.artist ?: t.artistName,
