@@ -5,13 +5,20 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.soundcloud.lite.api.AlternativeSource
 import com.soundcloud.lite.api.AudiusApi
+import com.soundcloud.lite.api.PlaylistImporter
+import com.soundcloud.lite.api.Provider
 import com.soundcloud.lite.api.TrackInfo
+import com.soundcloud.lite.api.YouTubeApi
+import com.soundcloud.lite.api.iTunesApi
 import com.soundcloud.lite.data.AppSettings
 import com.soundcloud.lite.data.Playlist
 import com.soundcloud.lite.data.SettingsRepository
 import com.soundcloud.lite.player.PlayerManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -25,12 +32,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepo = SettingsRepository(application)
     val settings: StateFlow<AppSettings> = settingsRepo.settings
 
-    val api: AudiusApi = AudiusApi()
-    val playerManager: PlayerManager = PlayerManager(application, api)
+    val audiusApi: AudiusApi = AudiusApi()
+    val youTubeApi: YouTubeApi = YouTubeApi()
+    val iTunes: iTunesApi = iTunesApi()
+    val playlistImporter: PlaylistImporter = PlaylistImporter(youTubeApi)
+    val playerManager: PlayerManager = PlayerManager(application, audiusApi, youTubeApi)
 
-    /** Long id → Audius alphanumeric id, populated lazily as we observe
-     *  tracks coming back from the API. Lets screens keep using Long
-     *  identifiers in NavHost arguments. */
+    /** Long id → opaque providerId. Lets screens keep using Long
+     *  identifiers in NavHost arguments. Populated lazily as we
+     *  observe tracks coming back from the API. */
     private val providerIdByNumeric = mutableMapOf<Long, String>()
 
     private val _searchQuery = MutableStateFlow("")
@@ -62,6 +72,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _toast = MutableStateFlow<String?>(null)
     val toast: StateFlow<String?> = _toast.asStateFlow()
+
+    private val _importInProgress = MutableStateFlow(false)
+    val importInProgress: StateFlow<Boolean> = _importInProgress.asStateFlow()
 
     fun updateSettings(transform: (AppSettings) -> AppSettings) {
         settingsRepo.update(transform)
@@ -105,15 +118,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun doSearch(query: String, append: Boolean, offset: Int = 0) {
         _isSearching.value = true
         try {
-            val page = withContext(Dispatchers.IO) { api.search(query, offset) }
-            rememberProviderIds(page.tracks)
-            _searchResults.update { if (append) it + page.tracks else page.tracks }
-            nextSearchOffset = page.nextOffset
+            // Fan out to both providers in parallel; whichever returns
+            // first contributes to the result set, the other backfills.
+            val results: List<TrackInfo> = withContext(Dispatchers.IO) {
+                coroutineScope {
+                    val audiusDef = async {
+                        runCatching { audiusApi.search(query, offset).tracks }.getOrDefault(emptyList())
+                    }
+                    val ytDef = async {
+                        if (offset == 0) runCatching { youTubeApi.search(query) }.getOrDefault(emptyList())
+                        else emptyList()  // YouTube via Invidious doesn't paginate, only first page
+                    }
+                    val (a, y) = listOf(audiusDef, ytDef).awaitAll()
+                    interleave(a, y)
+                }
+            }
+            rememberProviderIds(results)
+            _searchResults.update { if (append) it + results else results }
+            // Audius drives pagination; treat YouTube as page-1 only.
+            nextSearchOffset = (offset + 50).takeIf { results.isNotEmpty() }
         } catch (t: Throwable) {
             _toast.value = "Search failed: ${t.message ?: t::class.java.simpleName}"
         } finally {
             _isSearching.value = false
         }
+    }
+
+    private fun interleave(a: List<TrackInfo>, b: List<TrackInfo>): List<TrackInfo> {
+        val out = ArrayList<TrackInfo>(a.size + b.size)
+        val iA = a.iterator(); val iB = b.iterator()
+        while (iA.hasNext() || iB.hasNext()) {
+            if (iA.hasNext()) out += iA.next()
+            if (iB.hasNext()) out += iB.next()
+        }
+        return out
     }
 
     // ---- Trending ----
@@ -129,7 +167,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _isLoadingTrending.value = true
             try {
-                val page = withContext(Dispatchers.IO) { api.getTrending(offset = off) }
+                val page = withContext(Dispatchers.IO) { audiusApi.getTrending(offset = off) }
                 rememberProviderIds(page.tracks)
                 _trending.update { it + page.tracks }
                 nextTrendingOffset = page.nextOffset
@@ -151,7 +189,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _related.value = emptyList()
             try {
-                val list = withContext(Dispatchers.IO) { api.getRelatedTracks(providerId) }
+                val list = withContext(Dispatchers.IO) {
+                    runCatching { audiusApi.getRelatedTracks(providerId) }.getOrDefault(emptyList())
+                }
                 rememberProviderIds(list)
                 _related.value = list
             } catch (t: Throwable) {
@@ -210,6 +250,82 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun playlistById(id: String): Playlist? = _playlists.value.firstOrNull { it.id == id }
+
+    /** Imports a playlist from a foreign-service URL. Tracks that don't
+     *  have a playable provider yet (e.g. SoundCloud-imported tracks)
+     *  are matched against YouTube as a best-effort, with iTunes used
+     *  to clean up the metadata. */
+    fun importPlaylistFromUrl(url: String) {
+        if (_importInProgress.value) return
+        _importInProgress.value = true
+        viewModelScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { playlistImporter.import(url) }
+                when (result) {
+                    is PlaylistImporter.ImportResult.UnsupportedUrl -> {
+                        _toast.value = "Unsupported URL. Try SoundCloud or YouTube."
+                    }
+                    is PlaylistImporter.ImportResult.Error -> {
+                        _toast.value = "Import failed (${result.sourceName}): ${result.message}"
+                    }
+                    is PlaylistImporter.ImportResult.Success -> {
+                        val resolvedTracks = withContext(Dispatchers.IO) { resolveImportedTracks(result.tracks) }
+                        rememberProviderIds(resolvedTracks)
+                        val pl = Playlist(
+                            id = "import:" + java.util.UUID.randomUUID().toString().take(8),
+                            title = result.title,
+                            tracks = resolvedTracks,
+                            artworkUrl = result.artworkUrl,
+                        )
+                        _playlists.update { it + pl }
+                        val matched = resolvedTracks.count { !it.isUnplayable }
+                        _toast.value = "Imported '${result.title}' (${matched}/${resolvedTracks.size} playable)"
+                    }
+                }
+            } catch (t: Throwable) {
+                _toast.value = "Import failed: ${t.message ?: t::class.java.simpleName}"
+            } finally {
+                _importInProgress.value = false
+            }
+        }
+    }
+
+    /** For each track that came in as an unplayable placeholder, search
+     *  YouTube/Audius for a playable equivalent. iTunes provides a
+     *  cleaner search query when available. */
+    private suspend fun resolveImportedTracks(tracks: List<TrackInfo>): List<TrackInfo> = coroutineScope {
+        tracks.map { t ->
+            async {
+                if (!t.isUnplayable) return@async t
+                val query = t.title.ifBlank { return@async t }
+                // 1) Try iTunes for canonical title+artist+art
+                val match = runCatching { iTunes.enrich(query) }.getOrNull()
+                val fullQuery = if (match != null) "${match.artist} ${match.title}" else query
+                // 2) Search YouTube for a playable version (then Audius as fallback)
+                val yt = runCatching { youTubeApi.search(fullQuery, limit = 1) }.getOrDefault(emptyList()).firstOrNull()
+                val playable = yt ?: runCatching {
+                    audiusApi.search(fullQuery, limit = 1).tracks.firstOrNull()
+                }.getOrNull()
+                if (playable != null) {
+                    playable.copy(
+                        title = match?.title ?: playable.title,
+                        artistName = match?.artist ?: playable.artistName,
+                        artworkUrl = match?.artworkUrl1000 ?: playable.artworkUrl,
+                        genre = match?.genre ?: playable.genre,
+                    )
+                } else {
+                    // No match anywhere — keep the placeholder, but at
+                    // least show clean metadata if iTunes had something.
+                    t.copy(
+                        title = match?.title ?: t.title,
+                        artistName = match?.artist ?: t.artistName,
+                        artworkUrl = match?.artworkUrl1000 ?: t.artworkUrl,
+                        isUnplayable = true,
+                    )
+                }
+            }
+        }.awaitAll()
+    }
 
     // ---- Alt sources (placeholder; UI shows a "not available in MVP" dialog) ----
 

@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -12,10 +13,14 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ContentPaste
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -28,6 +33,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -39,8 +46,12 @@ fun PlaylistsScreen(
     onOpenPlaylist: (String) -> Unit = {},
 ) {
     val playlists by viewModel.playlists.collectAsState()
+    val importInProgress by viewModel.importInProgress.collectAsState()
     var showCreate by remember { mutableStateOf(false) }
+    var showImport by remember { mutableStateOf(false) }
     var newTitle by remember { mutableStateOf("") }
+    var importUrl by remember { mutableStateOf("") }
+    val clipboard = LocalClipboardManager.current
 
     Box(modifier = Modifier.fillMaxSize()) {
         if (playlists.isEmpty()) {
@@ -55,7 +66,7 @@ fun PlaylistsScreen(
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    text = "No playlists yet.\nTap + to create one.",
+                    text = "No playlists yet.\nTap + to create or ↓ to import.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 12.dp),
                 )
@@ -89,13 +100,25 @@ fun PlaylistsScreen(
             }
         }
 
-        FloatingActionButton(
-            onClick = { newTitle = ""; showCreate = true },
+        Row(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .padding(bottom = 96.dp, end = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Icon(Icons.Filled.Add, contentDescription = "Create playlist")
+            FloatingActionButton(
+                onClick = {
+                    importUrl = clipboard.getText()?.text.orEmpty()
+                    showImport = true
+                },
+            ) {
+                Icon(Icons.Filled.Download, contentDescription = "Import playlist")
+            }
+            FloatingActionButton(
+                onClick = { newTitle = ""; showCreate = true },
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = "Create playlist")
+            }
         }
     }
 
@@ -119,6 +142,67 @@ fun PlaylistsScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showCreate = false }) { Text("Cancel") }
+            },
+        )
+    }
+
+    if (showImport) {
+        AlertDialog(
+            onDismissRequest = { if (!importInProgress) showImport = false },
+            title = { Text("Import playlist") },
+            text = {
+                Column {
+                    Text(
+                        text = "Paste a SoundCloud or YouTube playlist URL. The app will look up each track on Audius/YouTube to make it playable.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = importUrl,
+                            onValueChange = { importUrl = it },
+                            placeholder = { Text("https://…") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                        )
+                        IconButton(onClick = {
+                            importUrl = clipboard.getText()?.text.orEmpty()
+                        }) {
+                            Icon(Icons.Filled.ContentPaste, contentDescription = "Paste from clipboard")
+                        }
+                    }
+                    if (importInProgress) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.padding(end = 12.dp))
+                            Text(
+                                text = "Importing… (matching tracks via YouTube + iTunes)",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = 12.sp,
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !importInProgress && importUrl.isNotBlank(),
+                    onClick = {
+                        viewModel.importPlaylistFromUrl(importUrl.trim())
+                        // Stay open so the user sees the spinner; close on
+                        // toast (the result is delivered via _toast).
+                        showImport = false
+                    },
+                ) { Text("Import") }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !importInProgress,
+                    onClick = { showImport = false },
+                ) { Text("Cancel") }
             },
         )
     }

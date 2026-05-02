@@ -140,10 +140,11 @@ class AudiusApi(
             val avatar = user?.profilePicture?.s480 ?: user?.profilePicture?.s150
             // TrackInfo.id is Long for back-compat with the old SoundCloud
             // models; we hash the alphanumeric Audius id to fit it.
-            val numericId = stableIdHash(id)
+            val numericId = stableIdHash("audius:$id")
             return TrackInfo(
                 id = numericId,
                 providerId = id,
+                provider = Provider.AUDIUS,
                 title = title ?: "Untitled",
                 artistName = artist,
                 artistId = artistId,

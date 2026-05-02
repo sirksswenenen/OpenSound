@@ -296,6 +296,14 @@ private val bottomTabs = listOf(
 fun AppRoot(viewModel: MainViewModel) {
     val navController = rememberNavController()
     val playerState by viewModel.playerManager.state.collectAsState()
+    val toast by viewModel.toast.collectAsState()
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    androidx.compose.runtime.LaunchedEffect(toast) {
+        toast?.let {
+            android.widget.Toast.makeText(ctx, it, android.widget.Toast.LENGTH_LONG).show()
+            viewModel.consumeToast()
+        }
+    }
 
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
