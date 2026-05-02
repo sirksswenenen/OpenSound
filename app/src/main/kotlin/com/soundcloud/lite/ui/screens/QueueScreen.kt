@@ -1,21 +1,26 @@
 package com.soundcloud.lite.ui.screens
 
-import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DragHandle
+import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -32,9 +37,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -52,6 +58,7 @@ fun QueueScreen(
     val state by viewModel.playerManager.state.collectAsState()
     val queue = state.queue
     val curIdx = state.queueIndex
+    val isQueueShuffled = state.shuffledOrder != null
     val listState = rememberLazyListState()
 
     // Drag-reorder state
@@ -59,9 +66,15 @@ fun QueueScreen(
     var dragOffsetY by remember { mutableStateOf(0f) }
     val density = LocalDensity.current
 
+    // Tracks the top-Y and height of the LazyColumn for edge auto-scroll
+    var listTopY by remember { mutableStateOf(0f) }
+    var listHeightPx by remember { mutableStateOf(0f) }
+
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = onBack) {
@@ -72,9 +85,26 @@ fun QueueScreen(
                 color = MaterialTheme.colorScheme.onSurface,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.padding(start = 4.dp),
+                modifier = Modifier
+                    .padding(start = 4.dp)
+                    .weight(1f),
             )
+            // Shuffle queue button: first tap shuffles, second restores original order
+            IconButton(
+                onClick = { viewModel.playerManager.shuffleQueue() },
+                enabled = queue.size > 1,
+            ) {
+                Icon(
+                    Icons.Filled.Shuffle,
+                    contentDescription = if (isQueueShuffled) "Restore order" else "Shuffle queue",
+                    tint = if (isQueueShuffled)
+                        MaterialTheme.colorScheme.primary
+                    else
+                        MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
+
         if (queue.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("Queue is empty", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -84,7 +114,13 @@ fun QueueScreen(
 
         LazyColumn(
             state = listState,
-            modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 12.dp)
+                .onGloballyPositioned { coords ->
+                    listTopY = coords.positionInRoot().y
+                    listHeightPx = coords.size.height.toFloat()
+                },
             contentPadding = PaddingValues(bottom = 96.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
@@ -106,9 +142,24 @@ fun QueueScreen(
                         draggingIndex = index
                         dragOffsetY = 0f
                     },
-                    onDrag = { delta ->
+                    onDrag = { delta, pointerYInRoot ->
                         dragOffsetY += delta
-                        // Reorder when drag crosses an item boundary (~60dp)
+
+                        // --- Edge auto-scroll ---
+                        val edgeZone = with(density) { 72.dp.toPx() }
+                        val relY = pointerYInRoot - listTopY
+                        val scrollSpeed = when {
+                            relY < edgeZone && relY >= 0 ->
+                                -((edgeZone - relY) / edgeZone * 18f)
+                            relY > listHeightPx - edgeZone && relY <= listHeightPx ->
+                                ((relY - (listHeightPx - edgeZone)) / edgeZone * 18f)
+                            else -> 0f
+                        }
+                        if (scrollSpeed != 0f) {
+                            listState.dispatchRawDelta(scrollSpeed)
+                        }
+
+                        // --- Reorder when drag crosses an item boundary (~64dp) ---
                         val rowPx = with(density) { 64.dp.toPx() }
                         val moved = (dragOffsetY / rowPx).toInt()
                         if (moved != 0) {
@@ -137,6 +188,11 @@ fun QueueScreen(
                     },
                     isDragging = draggingIndex == index,
                     dragOffsetY = if (draggingIndex == index) dragOffsetY else 0f,
+                    modifier = Modifier.animateItem(
+                        fadeInSpec = null,
+                        fadeOutSpec = null,
+                        placementSpec = spring(stiffness = 400f, dampingRatio = 0.8f),
+                    ),
                 )
             }
         }
@@ -150,15 +206,16 @@ private fun QueueRow(
     onPlay: () -> Unit,
     onSwipeAway: () -> Unit,
     onDragStart: () -> Unit,
-    onDrag: (Float) -> Unit,
+    onDrag: (delta: Float, pointerYInRoot: Float) -> Unit,
     onDragEnd: () -> Unit,
     isDragging: Boolean,
     dragOffsetY: Float,
+    modifier: Modifier = Modifier,
 ) {
-    // Swipe-to-dismiss with 50% threshold (Bug E from earlier — Material3
-    // default is ~56dp which fires after a tiny flick).
+    // Swipe-to-dismiss: require 65% drag before committing — prevents
+    // accidental removal from a tiny flick (was 50% before).
     val dismissState = rememberSwipeToDismissBoxState(
-        positionalThreshold = { totalDistance -> totalDistance * 0.5f },
+        positionalThreshold = { totalDistance -> totalDistance * 0.65f },
     )
     LaunchedEffect(dismissState.currentValue) {
         if (dismissState.currentValue != SwipeToDismissBoxValue.Settled) {
@@ -166,14 +223,36 @@ private fun QueueRow(
             dismissState.reset()
         }
     }
+
     SwipeToDismissBox(
         state = dismissState,
+        modifier = modifier,
         backgroundContent = {
+            // Show a delete indicator only on the side the user is swiping
+            // toward, constrained to the far edge so it never peeks under
+            // the track artwork.
+            val alignment = when (dismissState.dismissDirection) {
+                SwipeToDismissBoxValue.StartToEnd -> Alignment.CenterStart
+                SwipeToDismissBoxValue.EndToStart -> Alignment.CenterEnd
+                else -> Alignment.CenterEnd
+            }
+            val fraction = (dismissState.progress).coerceIn(0f, 1f)
             Box(
-                modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
-                contentAlignment = Alignment.CenterStart,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        MaterialTheme.colorScheme.errorContainer.copy(
+                            alpha = (fraction * 1.5f).coerceIn(0f, 1f)
+                        )
+                    ),
+                contentAlignment = alignment,
             ) {
-                Text("Remove", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                Icon(
+                    Icons.Filled.Delete,
+                    contentDescription = "Remove",
+                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(horizontal = 20.dp),
+                )
             }
         },
     ) {
@@ -183,33 +262,46 @@ private fun QueueRow(
                 .graphicsLayer {
                     if (isDragging) {
                         translationY = dragOffsetY
-                        alpha = 0.85f
+                        shadowElevation = 12f
+                        scaleX = 1.02f
+                        scaleY = 1.02f
+                        alpha = 0.92f
                     }
                 },
             verticalAlignment = Alignment.CenterVertically,
         ) {
             TrackRow(
                 track = track,
-                modifier = Modifier
-                    .weight(1f),
+                modifier = Modifier.weight(1f),
                 onClick = onPlay,
             )
-            // Drag handle: long-press anywhere on it to start a reorder
+            // Drag handle — tracks pointer Y in root coords for auto-scroll
+            var handleRootY by remember { mutableStateOf(0f) }
             IconButton(
                 onClick = {},
-                modifier = Modifier.pointerInput(Unit) {
-                    detectDragGesturesAfterLongPress(
-                        onDragStart = { onDragStart() },
-                        onDrag = { _, drag -> onDrag(drag.y) },
-                        onDragEnd = { onDragEnd() },
-                        onDragCancel = { onDragEnd() },
-                    )
-                },
+                modifier = Modifier
+                    .onGloballyPositioned { coords ->
+                        handleRootY = coords.positionInRoot().y + coords.size.height / 2f
+                    }
+                    .pointerInput(Unit) {
+                        detectDragGesturesAfterLongPress(
+                            onDragStart = { onDragStart() },
+                            onDrag = { change, drag ->
+                                handleRootY += drag.y
+                                onDrag(drag.y, handleRootY)
+                            },
+                            onDragEnd = { onDragEnd() },
+                            onDragCancel = { onDragEnd() },
+                        )
+                    },
             ) {
                 Icon(
                     Icons.Filled.DragHandle,
                     contentDescription = "Drag to reorder",
-                    tint = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    tint = if (isCurrent)
+                        MaterialTheme.colorScheme.primary
+                    else
+                        MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }

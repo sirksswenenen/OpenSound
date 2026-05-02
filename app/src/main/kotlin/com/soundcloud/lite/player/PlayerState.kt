@@ -12,4 +12,7 @@ data class PlayerState(
     val repeatMode: Int = 0,
     val shuffle: Boolean = false,
     val error: String? = null,
+    /** Non-null while the queue is shuffled; holds the pre-shuffle order so
+     *  a second tap of the shuffle button can restore the original list. */
+    val shuffledOrder: List<TrackInfo>? = null,
 )

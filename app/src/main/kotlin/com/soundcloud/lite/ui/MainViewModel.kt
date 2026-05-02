@@ -290,22 +290,69 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** For each track that came in as an unplayable placeholder, search
-     *  YouTube/Audius for a playable equivalent. iTunes provides a
-     *  cleaner search query when available. */
+    /**
+     * For each track that came in as an unplayable placeholder (e.g. from a
+     * SoundCloud playlist import), search YouTube / Audius for a playable
+     * equivalent.
+     *
+     * Key improvement over the naive first-result approach: when the source
+     * track has a known duration (from SC JSON-LD), we fetch several YouTube
+     * candidates and pick the one whose duration is closest to the expected
+     * value.  This filters out 30-second previews and short clips that
+     * Invidious sometimes surfaces at the top of search results for
+     * region-locked tracks.
+     *
+     * Matching rules:
+     *   1. Duration must be within ±25 % of the expected value (if known).
+     *   2. Among survivors the closest duration wins.
+     *   3. If nothing survives the duration gate, fall back to Audius.
+     *   4. If Audius also fails, keep the placeholder.
+     */
     private suspend fun resolveImportedTracks(tracks: List<TrackInfo>): List<TrackInfo> = coroutineScope {
         tracks.map { t ->
             async {
                 if (!t.isUnplayable) return@async t
                 val query = t.title.ifBlank { return@async t }
-                // 1) Try iTunes for canonical title+artist+art
+
+                // 1) iTunes enrichment: canonical title+artist+artwork
                 val match = runCatching { iTunes.enrich(query) }.getOrNull()
                 val fullQuery = if (match != null) "${match.artist} ${match.title}" else query
-                // 2) Search YouTube for a playable version (then Audius as fallback)
-                val yt = runCatching { youTubeApi.search(fullQuery, limit = 1) }.getOrDefault(emptyList()).firstOrNull()
-                val playable = yt ?: runCatching {
-                    audiusApi.search(fullQuery, limit = 1).tracks.firstOrNull()
-                }.getOrNull()
+
+                // 2) Fetch several YT candidates (more choices → better duration match)
+                val ytCandidates = runCatching {
+                    youTubeApi.search(fullQuery, limit = 8)
+                }.getOrDefault(emptyList())
+
+                // 3) Duration-aware selection
+                val expectedMs = t.duration.takeIf { it > 5_000L } // ignore if <5 s (missing metadata)
+                val yt: TrackInfo? = if (expectedMs != null && expectedMs > 0) {
+                    val tolerance = expectedMs * 0.25
+                    val filtered = ytCandidates.filter { c ->
+                        c.duration > 0L && kotlin.math.abs(c.duration - expectedMs) <= tolerance
+                    }
+                    (filtered.ifEmpty { null })
+                        ?.minByOrNull { kotlin.math.abs(it.duration - expectedMs) }
+                } else {
+                    // No duration info — trust the first result as before
+                    ytCandidates.firstOrNull()
+                }
+
+                // 4) Audius fallback (also applies best-effort duration check)
+                val playable: TrackInfo? = yt ?: run {
+                    val audiusCandidates = runCatching {
+                        audiusApi.search(fullQuery, limit = 5).tracks
+                    }.getOrDefault(emptyList())
+                    if (expectedMs != null && expectedMs > 0) {
+                        val tolerance = expectedMs * 0.30
+                        val filtered = audiusCandidates.filter { c ->
+                            c.duration > 0L && kotlin.math.abs(c.duration - expectedMs) <= tolerance
+                        }
+                        (filtered.ifEmpty { audiusCandidates }).firstOrNull()
+                    } else {
+                        audiusCandidates.firstOrNull()
+                    }
+                }
+
                 if (playable != null) {
                     playable.copy(
                         title = match?.title ?: playable.title,
@@ -314,8 +361,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         genre = match?.genre ?: playable.genre,
                     )
                 } else {
-                    // No match anywhere — keep the placeholder, but at
-                    // least show clean metadata if iTunes had something.
+                    // No match anywhere — keep the placeholder with clean metadata.
                     t.copy(
                         title = match?.title ?: t.title,
                         artistName = match?.artist ?: t.artistName,

@@ -224,6 +224,36 @@ class PlayerManager(
         _state.update { it.copy(queue = newQueue, queueIndex = safeIdx) }
     }
 
+    /**
+     * Shuffle all tracks in the queue in-place, keeping the currently
+     * playing track pinned at its current position so playback continues
+     * uninterrupted. A second call restores the original order (acts as
+     * toggle: shuffle → unshuffle → shuffle …).
+     */
+    fun shuffleQueue() {
+        val cur = _state.value
+        val queue = cur.queue
+        if (queue.size < 2) return
+        val curIdx = cur.queueIndex
+
+        if (cur.shuffledOrder != null) {
+            // Restore original order
+            val restored = cur.shuffledOrder
+            val newCurIdx = restored.indexOfFirst { it.id == queue.getOrNull(curIdx)?.id }
+                .takeIf { it >= 0 } ?: curIdx
+            _state.update { it.copy(queue = restored, queueIndex = newCurIdx, shuffledOrder = null) }
+        } else {
+            // Save original, shuffle everything except current track
+            val currentTrack = queue.getOrNull(curIdx)
+            val others = queue.toMutableList().also { it.removeAt(curIdx) }
+            others.shuffle()
+            val shuffled = others.toMutableList().also {
+                if (currentTrack != null) it.add(0, currentTrack)
+            }
+            _state.update { it.copy(queue = shuffled, queueIndex = if (currentTrack != null) 0 else 0, shuffledOrder = queue) }
+        }
+    }
+
     private fun mediaItem(track: TrackInfo, url: String): MediaItem {
         val md = MediaMetadata.Builder()
             .setTitle(track.title)
