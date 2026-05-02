@@ -1,0 +1,14 @@
+# Gradle
+.gradle/
+build/
+*/build/
+local.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Keep the keystore (debug-style) so the build works out of the box.
+# DO NOT commit production keystores to a public repo.

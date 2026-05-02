@@ -1,0 +1,249 @@
+package com.soundcloud.lite.player
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Player
+import androidx.media3.session.MediaController
+import androidx.media3.session.SessionToken
+import com.google.common.util.concurrent.ListenableFuture
+import com.soundcloud.lite.api.SoundCloudApi
+import com.soundcloud.lite.api.TrackInfo
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/**
+ * Wraps a Media3 ExoPlayer (running inside a foreground service) and
+ * exposes its state as a Compose-friendly StateFlow.
+ *
+ * Designed so the rest of the app talks to PlayerState only — never to
+ * ExoPlayer directly. That makes the player easy to swap or stub.
+ */
+class PlayerManager(
+    private val context: Context,
+    private val api: SoundCloudApi,
+) {
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    private val _state = MutableStateFlow(PlayerState())
+    val state: StateFlow<PlayerState> = _state.asStateFlow()
+
+    private var controller: MediaController? = null
+    private var pendingTrack: TrackInfo? = null
+    private var pendingQueue: List<TrackInfo> = emptyList()
+    private var positionPoller: Job? = null
+    private var connectFuture: ListenableFuture<MediaController>? = null
+
+    init { connect() }
+
+    private fun connect() {
+        val token = SessionToken(
+            context.applicationContext,
+            ComponentName(context.applicationContext, PlaybackService::class.java),
+        )
+        connectFuture = MediaController.Builder(context.applicationContext, token).buildAsync().also { fut ->
+            fut.addListener({
+                val ctl = fut.get()
+                controller = ctl
+                ctl.addListener(object : Player.Listener {
+                    override fun onIsPlayingChanged(isPlaying: Boolean) { syncState() }
+                    override fun onPlaybackStateChanged(playbackState: Int) {
+                        syncState()
+                        if (playbackState == Player.STATE_READY) startPositionPolling()
+                        if (playbackState == Player.STATE_ENDED) {
+                            stopPositionPolling()
+                            // Auto-advance to next queue item if any.
+                            skipNext()
+                        }
+                    }
+                    override fun onPositionDiscontinuity(
+                        oldPosition: Player.PositionInfo,
+                        newPosition: Player.PositionInfo,
+                        reason: Int,
+                    ) { syncState() }
+                })
+                pendingTrack?.let { play(it, pendingQueue) }
+                pendingTrack = null
+            }, context.mainExecutor)
+        }
+    }
+
+    fun release() {
+        scope.cancel()
+        controller?.release()
+        controller = null
+    }
+
+    /** Queue a track + optional surrounding queue and start playback. */
+    fun play(track: TrackInfo, queue: List<TrackInfo>) {
+        val ctl = controller
+        if (ctl == null) {
+            pendingTrack = track
+            pendingQueue = queue
+            return
+        }
+        scope.launch {
+            try {
+                val resolvedQueue = if (queue.isEmpty()) listOf(track) else queue
+                val startIndex = resolvedQueue.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
+
+                // Resolve only the track being played now; other queue items
+                // will be resolved lazily on transition. SoundCloud's stream
+                // URLs are short-lived so we can't pre-resolve everything.
+                val streamUrl = withContext(Dispatchers.IO) { api.getPlayableStream(track.id) }
+
+                // Only enqueue the current track in the player; we'll
+                // re-prepare the next one in onMediaItemTransition. Putting
+                // empty URLs in the player's queue makes ExoPlayer choke on
+                // transition.
+                ctl.setMediaItems(listOf(mediaItem(track, streamUrl)), 0, 0)
+                ctl.prepare()
+                ctl.play()
+                _state.update {
+                    it.copy(
+                        currentTrack = track,
+                        queue = resolvedQueue,
+                        queueIndex = startIndex,
+                        duration = if (track.duration > 0) track.duration else 0,
+                    )
+                }
+                startPositionPolling()
+            } catch (t: Throwable) {
+                _state.update { it.copy(error = "Failed to play: ${t.message ?: t::class.java.simpleName}") }
+            }
+        }
+    }
+
+    fun togglePlayPause() {
+        val ctl = controller ?: return
+        if (ctl.isPlaying) ctl.pause() else ctl.play()
+    }
+
+    fun skipNext() {
+        val cur = _state.value
+        val nextIdx = cur.queueIndex + 1
+        val track = cur.queue.getOrNull(nextIdx) ?: return
+        playAtIndex(track, nextIdx)
+    }
+
+    fun skipPrevious() {
+        val ctl = controller ?: return
+        val cur = _state.value
+        if (ctl.currentPosition > 4_000) {
+            ctl.seekTo(0)
+            return
+        }
+        val prevIdx = cur.queueIndex - 1
+        val track = cur.queue.getOrNull(prevIdx) ?: run {
+            ctl.seekTo(0); return
+        }
+        playAtIndex(track, prevIdx)
+    }
+
+    private fun playAtIndex(track: com.soundcloud.lite.api.TrackInfo, index: Int) {
+        val ctl = controller ?: return
+        scope.launch {
+            try {
+                val url = withContext(Dispatchers.IO) { api.getPlayableStream(track.id) }
+                ctl.setMediaItem(mediaItem(track, url), 0)
+                ctl.prepare()
+                ctl.play()
+                _state.update {
+                    it.copy(
+                        currentTrack = track,
+                        queueIndex = index,
+                        duration = if (track.duration > 0) track.duration else 0,
+                    )
+                }
+            } catch (t: Throwable) {
+                _state.update { it.copy(error = "Failed to load track: ${t.message ?: t::class.java.simpleName}") }
+            }
+        }
+    }
+
+    fun seekTo(positionMs: Long) { controller?.seekTo(positionMs) }
+
+    fun toggleShuffle() {
+        val ctl = controller ?: return
+        ctl.shuffleModeEnabled = !ctl.shuffleModeEnabled
+        _state.update { it.copy(shuffle = ctl.shuffleModeEnabled) }
+    }
+
+    fun cycleRepeat() {
+        val ctl = controller ?: return
+        val next = when (ctl.repeatMode) {
+            Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+            Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+            else -> Player.REPEAT_MODE_OFF
+        }
+        ctl.repeatMode = next
+        _state.update { it.copy(repeatMode = next) }
+    }
+
+    /** Public: replace queue (used by Queue screen drag-reorder + delete). */
+    fun setQueue(newQueue: List<TrackInfo>, currentIndex: Int) {
+        // The player itself only ever holds one MediaItem; we just update
+        // the conceptual queue + index here. Actual playback continues
+        // unaffected unless the current track was removed.
+        val safeIdx = currentIndex.coerceIn(0, (newQueue.size - 1).coerceAtLeast(0))
+        _state.update { it.copy(queue = newQueue, queueIndex = safeIdx) }
+    }
+
+    private fun mediaItem(track: TrackInfo, url: String): MediaItem {
+        val md = MediaMetadata.Builder()
+            .setTitle(track.title)
+            .setArtist(track.artistName)
+            .setArtworkUri(track.artworkUrl?.let { android.net.Uri.parse(it) })
+            .build()
+        return MediaItem.Builder()
+            .setMediaId(track.id.toString())
+            .setUri(url)
+            .setMediaMetadata(md)
+            .build()
+    }
+
+    private fun syncState() {
+        val ctl = controller ?: return
+        val isPlaying = ctl.isPlaying
+        val pos = ctl.currentPosition.coerceAtLeast(0)
+        val dur = ctl.duration.takeIf { it != C.TIME_UNSET }?.coerceAtLeast(0L) ?: 0L
+        _state.update {
+            it.copy(
+                isPlaying = isPlaying,
+                position = pos,
+                duration = if (dur > 0) dur else it.duration,
+            )
+        }
+    }
+
+    private fun startPositionPolling() {
+        positionPoller?.cancel()
+        positionPoller = scope.launch {
+            while (true) {
+                delay(500)
+                val ctl = controller ?: continue
+                val pos = ctl.currentPosition.coerceAtLeast(0)
+                val dur = ctl.duration.takeIf { it != C.TIME_UNSET }?.coerceAtLeast(0L) ?: 0L
+                _state.update { it.copy(position = pos, duration = if (dur > 0) dur else it.duration) }
+            }
+        }
+    }
+
+    private fun stopPositionPolling() {
+        positionPoller?.cancel(); positionPoller = null
+    }
+
+    private fun CoroutineScope.cancel() = (this.coroutineContext[Job] as? Job)?.cancel()
+}
