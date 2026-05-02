@@ -4,7 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.soundcloud.lite.api.AlternativeSource
-import com.soundcloud.lite.api.SoundCloudApi
+import com.soundcloud.lite.api.AudiusApi
 import com.soundcloud.lite.api.TrackInfo
 import com.soundcloud.lite.data.AppSettings
 import com.soundcloud.lite.data.Playlist
@@ -25,8 +25,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepo = SettingsRepository(application)
     val settings: StateFlow<AppSettings> = settingsRepo.settings
 
-    val api: SoundCloudApi = SoundCloudApi()
+    val api: AudiusApi = AudiusApi()
     val playerManager: PlayerManager = PlayerManager(application, api)
+
+    /** Long id → Audius alphanumeric id, populated lazily as we observe
+     *  tracks coming back from the API. Lets screens keep using Long
+     *  identifiers in NavHost arguments. */
+    private val providerIdByNumeric = mutableMapOf<Long, String>()
 
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
@@ -58,15 +63,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _toast = MutableStateFlow<String?>(null)
     val toast: StateFlow<String?> = _toast.asStateFlow()
 
-    init {
-        // Forward OAuth token from settings → api
-        viewModelScope.launch {
-            settings.collect { s -> api.setOAuthToken(s.soundCloudOAuthToken) }
-        }
-    }
-
     fun updateSettings(transform: (AppSettings) -> AppSettings) {
         settingsRepo.update(transform)
+    }
+
+    private fun rememberProviderIds(tracks: Collection<TrackInfo>) {
+        for (t in tracks) if (t.providerId.isNotBlank()) providerIdByNumeric[t.id] = t.providerId
     }
 
     // ---- Search ----
@@ -104,9 +106,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _isSearching.value = true
         try {
             val page = withContext(Dispatchers.IO) { api.search(query, offset) }
-            _searchResults.update {
-                if (append) it + page.tracks else page.tracks
-            }
+            rememberProviderIds(page.tracks)
+            _searchResults.update { if (append) it + page.tracks else page.tracks }
             nextSearchOffset = page.nextOffset
         } catch (t: Throwable) {
             _toast.value = "Search failed: ${t.message ?: t::class.java.simpleName}"
@@ -129,6 +130,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _isLoadingTrending.value = true
             try {
                 val page = withContext(Dispatchers.IO) { api.getTrending(offset = off) }
+                rememberProviderIds(page.tracks)
                 _trending.update { it + page.tracks }
                 nextTrendingOffset = page.nextOffset
             } catch (t: Throwable) {
@@ -142,9 +144,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ---- Related ----
 
     fun loadRelated(trackId: Long) {
+        val providerId = providerIdByNumeric[trackId] ?: run {
+            _toast.value = "No related: track id missing"
+            return
+        }
         viewModelScope.launch {
+            _related.value = emptyList()
             try {
-                val list = withContext(Dispatchers.IO) { api.getRelatedTracks(trackId) }
+                val list = withContext(Dispatchers.IO) { api.getRelatedTracks(providerId) }
+                rememberProviderIds(list)
                 _related.value = list
             } catch (t: Throwable) {
                 _toast.value = "Related failed: ${t.message ?: t::class.java.simpleName}"
@@ -157,10 +165,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ---- Playback ----
 
     fun playTrack(track: TrackInfo, queue: List<TrackInfo>) {
+        rememberProviderIds(queue + track)
         playerManager.play(track, queue.ifEmpty { listOf(track) })
     }
 
     fun playSearchResult(track: TrackInfo) {
+        rememberProviderIds(_searchResults.value + track)
         playerManager.play(track, _searchResults.value.ifEmpty { listOf(track) })
     }
 
@@ -181,6 +191,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun addToPlaylist(playlistId: String, track: TrackInfo) {
+        rememberProviderIds(listOf(track))
         _playlists.update { list ->
             list.map { p ->
                 if (p.id == playlistId && p.tracks.none { it.id == track.id }) {
@@ -209,7 +220,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun closeAlternativeSources() { _altSourceState.value = null }
 
     fun playAlternative(track: TrackInfo, alt: AlternativeSource) {
-        // MVP: not implemented (would route through Cobalt or a YT-DL backend)
         _toast.value = "Alternative sources are not available yet"
         _altSourceState.value = null
     }

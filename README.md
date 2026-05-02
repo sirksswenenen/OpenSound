@@ -1,34 +1,57 @@
-# OpenSC
+# OpenSound
 
-A SoundCloud-like Android client written from scratch in Kotlin + Jetpack
-Compose. This is a ground-up MVP rewrite of an earlier APK-patching
-project — none of the code in `app/src/main/kotlin/` depends on a
-pre-existing APK or proprietary jar. Building with the included Gradle
-wrapper produces a complete, signed, runnable APK.
+An Android music client for the [Audius](https://audius.org) decentralized
+streaming network, written from scratch in Kotlin + Jetpack Compose.
 
-## Status (v0.1.0)
+This is a ground-up rewrite of an earlier APK-patching project — none of
+the code in `app/src/main/kotlin/` depends on a pre-existing APK or
+proprietary jar. Cloning the repo and running the included Gradle
+wrapper produces a complete, signed, runnable APK with no external
+inputs:
+
+```
+git clone https://github.com/terrr88599803-alt/OpenSound.git
+cd OpenSound
+./gradlew :app:assembleRelease
+# → app/build/outputs/apk/release/app-release.apk
+```
+
+## Why Audius (and not SoundCloud)
+
+The earlier prototype hit SoundCloud's `api-v2` directly, which has two
+practical problems:
+
+* tracks get region-locked or pulled by rights-holders (so the app
+  surfaces a lot of dead links), and
+* the public anonymous `client_id` rotates aggressively, which means
+  the app spends time scraping the SoundCloud homepage looking for the
+  current one.
+
+Audius is a permissionless catalog with millions of tracks (a lot of
+dance / hip-hop / electronic / lo-fi), no region locks, and a stable
+public read API at `https://api.audius.co`. No client_id, no OAuth, no
+geo restrictions. We pass `app_name=OpenSound` so Audius can attribute
+the traffic.
+
+## Status (v0.1.2)
 
 | Feature                                    | State        |
 | ------------------------------------------ | ------------ |
-| Search SoundCloud tracks                   | Working      |
-| Stream playback (HLS / progressive)        | Working      |
+| Search Audius tracks                       | Working      |
+| Stream playback (mp3 over HTTPS)           | Working      |
 | Background play + media notification       | Working      |
 | Queue screen with drag-to-reorder          | Working      |
 | Swipe-to-remove queue items (50% threshold)| Working      |
 | Local playlists (in-memory MVP)            | Working      |
-| Trending tracks (Charts API)               | Working      |
-| Related tracks                             | Working      |
-| Settings (theme, OAuth token, glass)       | Working      |
+| Trending tracks                            | Working      |
+| Related tracks (artist-fallback)           | Working      |
 | Liquid Glass UI (GPU + StackBlur)          | Inherited    |
+| 3 launcher-icon variants (Orange/Cyan/Purple) | Working   |
 | Offline downloads                          | Not yet      |
 | Waveform display in fullscreen player      | Not yet      |
 | Alternative sources (Cobalt / YT fallback) | Not yet      |
 | Importing remote playlists by URL          | Not yet      |
 | Persisting playlists across runs (Room)    | Not yet      |
-
-The "not yet" items are tracked for the next iteration; the architecture
-already has room for them (the PlayerManager and the SoundCloudApi can
-be plugged into a Room-backed download index without touching the UI).
 
 ## Architecture
 
@@ -39,8 +62,8 @@ ui/
   screens/                 ─ one Composable per route
   components/              ─ MiniPlayer, TrackRow, GlassSurface, …
 api/
-  SoundCloudApi.kt         ─ OkHttp + Moshi wrapper around api-v2.soundcloud.com
-  TrackInfo.kt             ─ track-domain data class
+  AudiusApi.kt             ─ OkHttp + Moshi wrapper around api.audius.co
+  TrackInfo.kt             ─ provider-agnostic track domain model
   AlternativeSource.kt     ─ placeholder for the Cobalt feature
   WaveformHelper.kt        ─ PNG → Float[] sample extractor
 data/
@@ -60,21 +83,10 @@ PlayerManager itself talks to a `MediaController` bound to the
 it as a MediaSession (so the system media notification + Bluetooth
 controls Just Work).
 
-## Getting a SoundCloud `client_id`
-
-The `api-v2.soundcloud.com` endpoints require a `client_id`. We pull it
-straight from the public web app at runtime:
-
-1. `GET https://soundcloud.com/`
-2. Walk every `<script src="…">` from the response.
-3. In each script body, regex-match `client_id\s*[:=]\s*"([a-zA-Z0-9]{32})"`.
-4. The first match is cached for the process lifetime.
-
-If SoundCloud rotates the id, kill the app and reopen — `ensureClientId`
-will fetch a fresh one. If you have an OAuth token (DevTools → Network
-→ any api-v2 request → `Authorization: OAuth …`), paste it in
-**Settings → SoundCloud OAuth token** to play tracks that are
-geo-locked or preview-only for anonymous users.
+The Audius `/v1/tracks/{id}/stream` endpoint redirects to a signed CDN
+URL on a different host; ExoPlayer's `DefaultHttpDataSource` handles
+the redirect with `setAllowCrossProtocolRedirects(true)` set in
+`PlaybackService`.
 
 ## Building
 
@@ -104,6 +116,8 @@ default. To sign with a different keystore:
 
 ## Disclaimer
 
-This project is a personal client for SoundCloud's public web API. It
-is not affiliated with or endorsed by SoundCloud Ltd. Use a real OAuth
-token from your own account if you need authenticated access.
+This project is a third-party client for the public Audius read API. It
+is not affiliated with or endorsed by Audius Inc. or SoundCloud Ltd.
+The package id is `com.soundcloud.lite` for upgrade-compatibility with
+earlier builds; despite the legacy package name, the app no longer
+talks to SoundCloud.
