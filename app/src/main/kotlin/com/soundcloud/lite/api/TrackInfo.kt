@@ -8,6 +8,7 @@ package com.soundcloud.lite.api
 data class TrackInfo(
     val id: Long = 0L,
     val providerId: String = "",
+    val provider: Provider = Provider.UNKNOWN,
     val title: String = "",
     val artistName: String = "",
     val artistId: String = "",
@@ -19,4 +20,8 @@ data class TrackInfo(
     val genre: String? = null,
     val playCount: Long? = null,
     val favoriteCount: Long? = null,
+    /** Marks the track as a placeholder imported from a foreign service
+     *  for which we couldn't find a playable match in our integrated
+     *  providers. Such tracks render greyed-out and won't start playback. */
+    val isUnplayable: Boolean = false,
 )

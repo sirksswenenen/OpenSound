@@ -11,7 +11,9 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import com.soundcloud.lite.api.AudiusApi
+import com.soundcloud.lite.api.Provider
 import com.soundcloud.lite.api.TrackInfo
+import com.soundcloud.lite.api.YouTubeApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,8 +34,15 @@ import kotlinx.coroutines.launch
  */
 class PlayerManager(
     private val context: Context,
-    private val api: AudiusApi,
+    private val audius: AudiusApi,
+    private val youtube: YouTubeApi,
 ) {
+
+    private fun resolveStreamUrl(track: TrackInfo): String? = when (track.provider) {
+        Provider.AUDIUS -> if (track.providerId.isNotBlank()) audius.streamUrl(track.providerId) else null
+        Provider.YOUTUBE -> if (track.providerId.isNotBlank()) youtube.streamUrl(track.providerId) else null
+        Provider.UNKNOWN -> null
+    }
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     private val _state = MutableStateFlow(PlayerState())
@@ -98,11 +107,18 @@ class PlayerManager(
                 val resolvedQueue = if (queue.isEmpty()) listOf(track) else queue
                 val startIndex = resolvedQueue.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
 
-                // Audius' /stream endpoint redirects to a short-lived
-                // signed CDN URL, but it does it on every request, so we
-                // can hand ExoPlayer the indirect URL and let it handle
-                // redirects + range requests itself.
-                val streamUrl = api.streamUrl(track.providerId)
+                if (track.isUnplayable) {
+                    _state.update { it.copy(error = "This track has no playable source yet.") }
+                    return@launch
+                }
+                // Both Audius (/stream) and Invidious (/latest_version)
+                // serve a short-lived 302 to a CDN URL on every request,
+                // so we hand the indirect URL to ExoPlayer and let it
+                // follow redirects + range-request the audio.
+                val streamUrl = resolveStreamUrl(track) ?: run {
+                    _state.update { it.copy(error = "Unsupported provider for ${track.title}") }
+                    return@launch
+                }
 
                 // Only enqueue the current track in the player; we'll
                 // re-prepare the next one in onMediaItemTransition. Putting
@@ -156,7 +172,14 @@ class PlayerManager(
         val ctl = controller ?: return
         scope.launch {
             try {
-                val url = api.streamUrl(track.providerId)
+                if (track.isUnplayable) {
+                    _state.update { it.copy(error = "This track has no playable source yet.") }
+                    return@launch
+                }
+                val url = resolveStreamUrl(track) ?: run {
+                    _state.update { it.copy(error = "Unsupported provider for ${track.title}") }
+                    return@launch
+                }
                 ctl.setMediaItem(mediaItem(track, url), 0)
                 ctl.prepare()
                 ctl.play()

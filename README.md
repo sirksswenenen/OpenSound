@@ -1,7 +1,10 @@
 # OpenSound
 
-An Android music client for the [Audius](https://audius.org) decentralized
-streaming network, written from scratch in Kotlin + Jetpack Compose.
+An Android music client that pulls audio from multiple free streaming
+backends ([Audius](https://audius.org) + YouTube via public Invidious
+proxies), with playlist import from SoundCloud / YouTube and metadata
+enrichment via the iTunes Search API. Written from scratch in Kotlin +
+Jetpack Compose.
 
 This is a ground-up rewrite of an earlier APK-patching project — none of
 the code in `app/src/main/kotlin/` depends on a pre-existing APK or
@@ -16,42 +19,70 @@ cd OpenSound
 # → app/build/outputs/apk/release/app-release.apk
 ```
 
-## Why Audius (and not SoundCloud)
+## Why multiple backends
 
 The earlier prototype hit SoundCloud's `api-v2` directly, which has two
-practical problems:
+practical problems: tracks get region-locked or pulled by rights-holders,
+and the anonymous `client_id` rotates often.
 
-* tracks get region-locked or pulled by rights-holders (so the app
-  surfaces a lot of dead links), and
-* the public anonymous `client_id` rotates aggressively, which means
-  the app spends time scraping the SoundCloud homepage looking for the
-  current one.
+We replaced SoundCloud with two complementary public catalogs:
 
-Audius is a permissionless catalog with millions of tracks (a lot of
-dance / hip-hop / electronic / lo-fi), no region locks, and a stable
-public read API at `https://api.audius.co`. No client_id, no OAuth, no
-geo restrictions. We pass `app_name=OpenSound` so Audius can attribute
-the traffic.
+* **Audius** — permissionless catalog (a few million tracks, mostly
+  electronic / hip-hop / lo-fi). Stable public read API at
+  `https://api.audius.co`. No `client_id`, no OAuth, no geo locks.
+* **YouTube** — accessed via the [Invidious](https://docs.invidious.io)
+  open API (public instances). The `/latest_version?id=…&itag=140`
+  endpoint serves the audio-only adaptive stream, which ExoPlayer can
+  consume directly. Used to fill in fan-edits, game OSTs, and anything
+  else that's not on Audius.
 
-## Status (v0.1.2)
+Search results from both providers are interleaved in the UI, with a
+per-row badge identifying the backend.
 
-| Feature                                    | State        |
-| ------------------------------------------ | ------------ |
-| Search Audius tracks                       | Working      |
-| Stream playback (mp3 over HTTPS)           | Working      |
-| Background play + media notification       | Working      |
-| Queue screen with drag-to-reorder          | Working      |
-| Swipe-to-remove queue items (50% threshold)| Working      |
-| Local playlists (in-memory MVP)            | Working      |
-| Trending tracks                            | Working      |
-| Related tracks (artist-fallback)           | Working      |
-| Liquid Glass UI (GPU + StackBlur)          | Inherited    |
-| 3 launcher-icon variants (Orange/Cyan/Purple) | Working   |
-| Offline downloads                          | Not yet      |
-| Waveform display in fullscreen player      | Not yet      |
-| Alternative sources (Cobalt / YT fallback) | Not yet      |
-| Importing remote playlists by URL          | Not yet      |
-| Persisting playlists across runs (Room)    | Not yet      |
+## Playlist import
+
+Paste a SoundCloud or YouTube playlist URL on the Playlists tab and the
+app:
+
+1. Auto-detects the source from the URL host.
+2. Scrapes the public playlist (SoundCloud: JSON-LD on the `/sets/`
+   page; YouTube: Invidious `/api/v1/playlists/{id}`).
+3. For each foreign track, queries the iTunes Search API to get a
+   canonical 1:1 cover, clean title, and original artist.
+4. Searches our integrated providers (YouTube → Audius) for a playable
+   match and copies its stream provider into the imported track.
+5. Tracks for which no match exists stay in the playlist as greyed-out
+   placeholders so you can see what was in the original.
+
+Spotify, Yandex.Music, Deezer and Apple Music import are scaffolded
+(URL detection works) but the actual scrapers aren't implemented yet —
+those services need either OAuth client registration or service-specific
+workarounds and will be added incrementally.
+
+## Status (v0.2.0)
+
+| Feature                                            | State     |
+| -------------------------------------------------- | --------- |
+| Search Audius tracks                               | Working   |
+| Search YouTube (Invidious) tracks                  | Working   |
+| Merged-provider search results with badges         | Working   |
+| Stream playback (mp3 from Audius, m4a from YT)     | Working   |
+| Background play + media notification               | Working   |
+| Queue screen with drag-to-reorder                  | Working   |
+| Swipe-to-remove queue items (50% threshold)        | Working   |
+| Local playlists (in-memory MVP)                    | Working   |
+| Import SoundCloud playlists by URL                 | Working   |
+| Import YouTube playlists by URL                    | Working   |
+| iTunes metadata enrichment for imported tracks     | Working   |
+| Trending tracks                                    | Working   |
+| Related tracks (Audius artist-fallback)            | Working   |
+| Liquid Glass UI (GPU + StackBlur)                  | Inherited |
+| 3 launcher-icon variants (Orange/Cyan/Purple)      | Working   |
+| Import Spotify / Yandex.Music / Deezer playlists   | Detected, scraping not impl. |
+| Offline downloads                                  | Not yet   |
+| Waveform display in fullscreen player              | Not yet   |
+| Alternative sources (Cobalt / YT fallback for Audius) | Not yet |
+| Persisting playlists across runs (Room)            | Not yet   |
 
 ## Architecture
 
@@ -62,7 +93,11 @@ ui/
   screens/                 ─ one Composable per route
   components/              ─ MiniPlayer, TrackRow, GlassSurface, …
 api/
+  Provider.kt              ─ enum tagging which backend served a track
   AudiusApi.kt             ─ OkHttp + Moshi wrapper around api.audius.co
+  YouTubeApi.kt            ─ wrapper around public Invidious instances
+  iTunesApi.kt             ─ free metadata enricher (1:1 covers + clean artist)
+  PlaylistImporter.kt      ─ smart-link dispatcher → SoundCloud/YouTube scrapers
   TrackInfo.kt             ─ provider-agnostic track domain model
   AlternativeSource.kt     ─ placeholder for the Cobalt feature
   WaveformHelper.kt        ─ PNG → Float[] sample extractor
@@ -83,10 +118,14 @@ PlayerManager itself talks to a `MediaController` bound to the
 it as a MediaSession (so the system media notification + Bluetooth
 controls Just Work).
 
-The Audius `/v1/tracks/{id}/stream` endpoint redirects to a signed CDN
-URL on a different host; ExoPlayer's `DefaultHttpDataSource` handles
-the redirect with `setAllowCrossProtocolRedirects(true)` set in
-`PlaybackService`.
+Both `audius_api.streamUrl(id)` (returns the `/v1/tracks/.../stream`
+indirect URL) and `youtube_api.streamUrl(videoId)` (returns the
+Invidious `/latest_version?id=…&itag=140` indirect URL) hand back URLs
+that 302 to a CDN signed URL on a *different* host. ExoPlayer's
+`DefaultHttpDataSource` handles those redirects via
+`setAllowCrossProtocolRedirects(true)` — set centrally in
+`PlaybackService` so any new provider that uses HTTP-redirects-to-CDN
+just works.
 
 ## Building
 

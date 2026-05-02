@@ -1,5 +1,6 @@
 package com.soundcloud.lite.ui.components
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -10,7 +11,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.background
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material3.Icon
@@ -19,6 +19,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -27,6 +28,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.soundcloud.lite.api.Provider
 import com.soundcloud.lite.api.TrackInfo
 
 @Composable
@@ -36,11 +38,13 @@ fun TrackRow(
     onClick: () -> Unit,
     trailing: @Composable (() -> Unit)? = null,
 ) {
+    val rowAlpha = if (track.isUnplayable) 0.4f else 1f
     Row(
         modifier = modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 4.dp, vertical = 6.dp),
+            .padding(horizontal = 4.dp, vertical = 6.dp)
+            .alpha(rowAlpha),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
@@ -66,17 +70,22 @@ fun TrackRow(
             }
         }
         Spacer(Modifier.width(10.dp))
-        Column(modifier = Modifier.padding(end = 4.dp)) {
+        Column(modifier = Modifier.padding(end = 4.dp).weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = track.title,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                ProviderBadge(track.provider)
+            }
             Text(
-                text = track.title,
-                color = MaterialTheme.colorScheme.onSurface,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text = track.artistName,
+                text = if (track.isUnplayable) "${track.artistName} · no playable source"
+                       else track.artistName,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp,
                 maxLines = 1,
@@ -88,4 +97,24 @@ fun TrackRow(
             trailing()
         }
     }
+}
+
+@Composable
+private fun ProviderBadge(provider: Provider) {
+    val (text, bg, fg) = when (provider) {
+        Provider.AUDIUS -> Triple("AUDIUS", Color(0xFF7138B7), Color.White)
+        Provider.YOUTUBE -> Triple("YT", Color(0xFFCC2222), Color.White)
+        Provider.UNKNOWN -> return
+    }
+    Text(
+        text = text,
+        color = fg,
+        fontSize = 9.sp,
+        fontWeight = FontWeight.Bold,
+        modifier = Modifier
+            .padding(start = 6.dp)
+            .clip(RoundedCornerShape(3.dp))
+            .background(bg)
+            .padding(horizontal = 4.dp, vertical = 1.dp),
+    )
 }
