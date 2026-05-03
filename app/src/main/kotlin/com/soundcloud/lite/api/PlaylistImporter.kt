@@ -5,19 +5,15 @@ import okhttp3.Request
 import java.util.concurrent.TimeUnit
 
 /**
- * Imports a playlist (metadata: title + track names + artists + durations)
- * from a foreign service URL. Actual playable streams are resolved later
- * by matching each imported track against Audius / YouTube.
+ * Imports a playlist from a foreign service URL.
+ * Actual streams are resolved later against Audius/YouTube.
  *
- * Supported sources:
- *   - SoundCloud user playlists (soundcloud.com/USER/sets/SETNAME or on.soundcloud.com short URLs)
- *   - YouTube playlists (youtube.com/playlist?list=…)
- *
- * SC import strategy (in order of preference):
- *   1. SC API-v2 via resolve endpoint — gives ALL tracks with artist names.
- *      Requires a client_id found in SoundCloud's page JS bundles.
- *   2. JSON-LD block — SC caps this at ~5 tracks for large playlists, but
- *      it's a reliable fallback when the client_id can't be extracted.
+ * SC import strategy (in order):
+ *  1. Parse window.__sc_hydration — embedded in HTML, always present.
+ *     Contains all track IDs (may be partial objects for large playlists).
+ *  2. If client_id found (in hydration app data, inline JS, or asset bundles):
+ *     batch-fetch full track data via /tracks?ids=…
+ *  3. JSON-LD fallback (only ~5 tracks but works without client_id).
  */
 class PlaylistImporter(
     private val youTubeApi: YouTubeApi,
@@ -31,9 +27,7 @@ class PlaylistImporter(
             val tracks: List<TrackInfo>,
             val sourceName: String,
         ) : ImportResult()
-
         data class Error(val sourceName: String, val message: String) : ImportResult()
-
         data object UnsupportedUrl : ImportResult()
     }
 
@@ -42,10 +36,10 @@ class PlaylistImporter(
         return try {
             when (source) {
                 Source.SOUNDCLOUD -> importSoundCloud(url)
-                Source.YOUTUBE -> importYouTube(url)
-                Source.SPOTIFY -> ImportResult.Error("Spotify", "Spotify playlists not yet supported.")
+                Source.YOUTUBE    -> importYouTube(url)
+                Source.SPOTIFY    -> ImportResult.Error("Spotify", "Spotify import not yet supported.")
                 Source.YANDEX_MUSIC -> ImportResult.Error("Yandex Music", "Yandex.Music import not yet supported.")
-                Source.DEEZER -> ImportResult.Error("Deezer", "Deezer import not yet supported.")
+                Source.DEEZER     -> ImportResult.Error("Deezer", "Deezer import not yet supported.")
                 Source.APPLE_MUSIC -> ImportResult.Error("Apple Music", "Apple Music import not yet supported.")
             }
         } catch (t: Throwable) {
@@ -54,12 +48,8 @@ class PlaylistImporter(
     }
 
     enum class Source(val display: String) {
-        SOUNDCLOUD("SoundCloud"),
-        YOUTUBE("YouTube"),
-        SPOTIFY("Spotify"),
-        YANDEX_MUSIC("Yandex Music"),
-        DEEZER("Deezer"),
-        APPLE_MUSIC("Apple Music"),
+        SOUNDCLOUD("SoundCloud"), YOUTUBE("YouTube"), SPOTIFY("Spotify"),
+        YANDEX_MUSIC("Yandex Music"), DEEZER("Deezer"), APPLE_MUSIC("Apple Music"),
     }
 
     fun detect(url: String): Source? {
@@ -75,120 +65,199 @@ class PlaylistImporter(
         }
     }
 
-    // ---- SoundCloud ----
+    // =========================================================
+    //  SoundCloud
+    // =========================================================
 
     private fun importSoundCloud(url: String): ImportResult {
         val html = httpGet(url, asBrowser = true)
             ?: return ImportResult.Error("SoundCloud", "Couldn't fetch playlist page")
 
-        // Strategy 1: SC API-v2 via resolve endpoint — returns ALL tracks with artist names.
-        val clientId = findScClientId(html)
-        if (clientId != null) {
-            val apiResult = tryScApiImport(url, clientId)
-            if (apiResult != null) return apiResult
+        // ── Step 1: parse __sc_hydration (always in the HTML) ──────────────
+        val hydration = extractHydration(html)
+
+        // ── Step 2: try to find client_id everywhere we can ─────────────────
+        val clientId = findClientId(html, hydration)
+
+        // ── Step 3: build track list ─────────────────────────────────────────
+        if (hydration != null) {
+            val result = buildFromHydration(hydration, clientId)
+            if (result != null) return result
         }
 
-        // Strategy 2: JSON-LD fallback (limited to ~5 tracks on large playlists).
+        // ── Step 4: JSON-LD last resort ──────────────────────────────────────
         val ld = SC_JSONLD_RE.find(html)?.groupValues?.get(1)?.trim()
             ?: return ImportResult.Error("SoundCloud",
-                "Playlist metadata not found in page (client_id extraction also failed)")
+                "No playlist data found in page (hydration and JSON-LD both missing)")
         return parseScJsonLd(ld)
     }
 
-    /**
-     * Finds the SC client_id by scanning:
-     *   1. Inline <script> blocks in the page HTML (fast path)
-     *   2. Linked JS asset bundles (slightly slower, but more reliable)
-     */
-    private fun findScClientId(html: String): String? {
-        val inline = SC_CLIENT_ID_RE.find(html)?.groupValues?.get(1)
-        if (inline != null) return inline
+    // ---- Hydration parsing ----
 
-        val assetUrls = SC_ASSET_URL_RE.findAll(html)
-            .map { it.groupValues[1] }
-            .distinct()
-            .toList()
+    /** Extracts window.__sc_hydration array content from the page HTML. */
+    private fun extractHydration(html: String): String? {
+        val marker = "window.__sc_hydration = "
+        val start = html.indexOf(marker)
+        if (start < 0) return null
+        val arrStart = html.indexOf('[', start + marker.length)
+        if (arrStart < 0) return null
+        return extractJsonArray(html, arrStart)
+    }
 
-        // Check the last few bundles first — config tends to be in later bundles.
-        for (assetUrl in assetUrls.takeLast(6)) {
-            val js = try { httpGet(assetUrl, asBrowser = false) } catch (_: Exception) { null } ?: continue
-            val id = SC_CLIENT_ID_RE.find(js)?.groupValues?.get(1)
-            if (id != null) return id
+    private data class HydrationResult(
+        val title: String,
+        val artworkUrl: String?,
+        val trackIds: List<String>,        // all track IDs (including partial)
+        val fullTracks: List<TrackInfo>,   // tracks with complete metadata already
+        val trackCount: Int,
+    )
+
+    private fun buildFromHydration(hydrationJson: String, clientId: String?): ImportResult? {
+        val hr = parseHydration(hydrationJson) ?: return null
+        if (hr.trackIds.isEmpty() && hr.fullTracks.isEmpty()) return null
+
+        val tracks = hr.fullTracks.toMutableList()
+
+        // Fetch metadata for the IDs that came back as partial objects
+        val missingIds = hr.trackIds.filterNot { id ->
+            hr.fullTracks.any { t -> t.providerId == id }
         }
-        return null
+        if (missingIds.isNotEmpty() && clientId != null) {
+            tracks += resolveTrackIds(missingIds, clientId)
+        } else if (missingIds.isNotEmpty()) {
+            // No client_id — add placeholders so the track count is right
+            for (id in missingIds) {
+                tracks += TrackInfo(
+                    id = AudiusApi.stableIdHash("sc-import:$id"),
+                    providerId = id,
+                    provider = Provider.UNKNOWN,
+                    title = "Track $id",
+                    isUnplayable = true,
+                )
+            }
+        }
+
+        if (tracks.isEmpty()) return null
+
+        return ImportResult.Success(
+            title = hr.title,
+            artworkUrl = hr.artworkUrl,
+            tracks = tracks,
+            sourceName = "SoundCloud",
+        )
     }
 
-    private fun tryScApiImport(playlistUrl: String, clientId: String): ImportResult? {
-        val resolveUrl = "https://api-v2.soundcloud.com/resolve?url=${
-            java.net.URLEncoder.encode(playlistUrl, "UTF-8")
-        }&client_id=$clientId"
+    private fun parseHydration(hydrationJson: String): HydrationResult? {
+        // Find the playlist hydratable entry
+        val playlistMarker = "\"hydratable\":\"playlist\""
+        val idx = hydrationJson.indexOf(playlistMarker)
+        if (idx < 0) return null
 
-        val json = try { httpGet(resolveUrl, asBrowser = false) } catch (_: Exception) { null }
-            ?: return null
+        // The data object follows: "data":{...}
+        val dataKey = "\"data\":"
+        val dataIdx = hydrationJson.indexOf(dataKey, idx)
+        if (dataIdx < 0) return null
+        val objStart = hydrationJson.indexOf('{', dataIdx + dataKey.length)
+        if (objStart < 0) return null
+        val playlistJson = extractJsonObject(hydrationJson, objStart) ?: return null
 
-        if (!json.contains("\"tracks\"") && !json.contains("kind")) return null
-
-        return parseScApiPlaylist(json, clientId)
-    }
-
-    private fun parseScApiPlaylist(json: String, clientId: String): ImportResult {
-        val title = extractJsonString(json, "\"title\"") ?: "SoundCloud Playlist"
-        val artworkUrl = extractJsonString(json, "\"artwork_url\"")
+        val title = extractJsonString(playlistJson, "\"title\"") ?: "SoundCloud Playlist"
+        val artworkUrl = extractJsonString(playlistJson, "\"artwork_url\"")
             ?.replace("-large.", "-t500x500.")
 
-        val tracksStart = json.indexOf("\"tracks\"")
-        if (tracksStart < 0) return ImportResult.Error("SoundCloud", "No tracks array in API response")
-        val arrStart = json.indexOf('[', tracksStart)
-        if (arrStart < 0) return ImportResult.Error("SoundCloud", "Malformed tracks array")
-        val tracksJson = extractJsonArray(json, arrStart)
-            ?: return ImportResult.Error("SoundCloud", "Couldn't parse tracks array")
+        val trackCount = extractJsonNumber(playlistJson, "\"track_count\"")?.toIntOrNull() ?: 0
+
+        // Parse tracks array
+        val tracksKey = "\"tracks\":"
+        val tracksKeyIdx = playlistJson.indexOf(tracksKey)
+        if (tracksKeyIdx < 0) return HydrationResult(title, artworkUrl, emptyList(), emptyList(), trackCount)
+
+        val arrStart = playlistJson.indexOf('[', tracksKeyIdx + tracksKey.length)
+        if (arrStart < 0) return HydrationResult(title, artworkUrl, emptyList(), emptyList(), trackCount)
+        val tracksJson = extractJsonArray(playlistJson, arrStart) ?: return HydrationResult(title, artworkUrl, emptyList(), emptyList(), trackCount)
 
         val trackObjects = splitJsonObjects(tracksJson)
-        val partialIds = mutableListOf<String>()
-        val tracks = mutableListOf<TrackInfo>()
+        val fullTracks = mutableListOf<TrackInfo>()
+        val allIds = mutableListOf<String>()
 
         for (obj in trackObjects) {
             val scId = extractJsonString(obj, "\"id\"") ?: extractJsonNumber(obj, "\"id\"") ?: continue
-            val trackTitle = extractJsonString(obj, "\"title\"")
-            if (trackTitle == null) {
-                partialIds += scId
-                continue
-            }
+            allIds += scId
+            val trackTitle = extractJsonString(obj, "\"title\"") ?: continue  // partial object
             val userBlock = extractJsonObjectBlock(obj, "\"user\"")
-            val artist = if (userBlock != null) extractJsonString(userBlock, "\"username\"") else null
+            val artist = if (userBlock != null) extractJsonString(userBlock, "\"username\"") ?: "" else ""
             val durationMs = extractJsonNumber(obj, "\"duration\"")?.toLongOrNull() ?: 0L
-            val artwork = extractJsonString(obj, "\"artwork_url\"")?.replace("-large.", "-t500x500.")
-            val numericId = AudiusApi.stableIdHash("sc-import:$scId")
-            tracks += TrackInfo(
-                id = numericId,
+            val artwork = (extractJsonString(obj, "\"artwork_url\"") ?: "")
+                .takeIf { it.isNotBlank() }
+                ?.replace("-large.", "-t500x500.")
+            fullTracks += TrackInfo(
+                id = AudiusApi.stableIdHash("sc-import:$scId"),
                 providerId = scId,
                 provider = Provider.UNKNOWN,
                 title = trackTitle,
-                artistName = artist ?: "",
+                artistName = artist,
                 artworkUrl = artwork,
                 duration = durationMs,
                 isUnplayable = true,
             )
         }
 
-        // Batch-resolve partial tracks (returned as {kind,id} only for large playlists)
-        if (partialIds.isNotEmpty()) {
-            tracks += resolvePartialTracks(partialIds, clientId)
-        }
-
-        return ImportResult.Success(
-            title = title,
-            artworkUrl = artworkUrl,
-            tracks = tracks,
-            sourceName = "SoundCloud",
-        )
+        return HydrationResult(title, artworkUrl, allIds, fullTracks, trackCount)
     }
 
-    /**
-     * Fetches full track metadata for IDs that were returned as partial objects.
-     * SC allows up to 50 IDs per request via /tracks?ids=...
-     */
-    private fun resolvePartialTracks(ids: List<String>, clientId: String): List<TrackInfo> {
+    // ---- client_id extraction ----
+
+    private fun findClientId(html: String, hydrationJson: String?): String? {
+        // 1. Look in hydration app entry: {"hydratable":"app","data":{"clientId":"..."}}
+        if (hydrationJson != null) {
+            val appMarker = "\"hydratable\":\"app\""
+            val appIdx = hydrationJson.indexOf(appMarker)
+            if (appIdx >= 0) {
+                val dataIdx = hydrationJson.indexOf("\"data\":", appIdx)
+                if (dataIdx >= 0) {
+                    val objStart = hydrationJson.indexOf('{', dataIdx)
+                    if (objStart >= 0) {
+                        val appData = extractJsonObject(hydrationJson, objStart)
+                        if (appData != null) {
+                            val id = extractJsonString(appData, "\"clientId\"")
+                                ?: extractJsonString(appData, "\"client_id\"")
+                            if (!id.isNullOrBlank()) return id
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Inline <script> content
+        val inlineMatch = SC_CLIENT_ID_RE.find(html)?.groupValues?.get(1)
+        if (!inlineMatch.isNullOrBlank()) return inlineMatch
+
+        // 3. Script src URLs in the page (client_id sometimes appears in query params)
+        val srcMatch = SC_CLIENT_ID_IN_SRC_RE.find(html)?.groupValues?.get(1)
+        if (!srcMatch.isNullOrBlank()) return srcMatch
+
+        // 4. Scan linked JS bundles
+        return findClientIdInBundles(html)
+    }
+
+    private fun findClientIdInBundles(html: String): String? {
+        val assetUrls = SC_ASSET_URL_RE.findAll(html)
+            .map { it.groupValues[1] }
+            .distinct()
+            .toList()
+        // Check last 8 bundles (config/vendor tend to be at the end)
+        for (url in assetUrls.takeLast(8)) {
+            val js = try { httpGet(url, asBrowser = false) } catch (_: Exception) { null } ?: continue
+            val id = SC_CLIENT_ID_RE.find(js)?.groupValues?.get(1)
+            if (!id.isNullOrBlank()) return id
+        }
+        return null
+    }
+
+    // ---- SC API batch track fetch ----
+
+    /** Fetches full metadata for the given SC track IDs via API-v2. */
+    private fun resolveTrackIds(ids: List<String>, clientId: String): List<TrackInfo> {
         val result = mutableListOf<TrackInfo>()
         ids.chunked(50).forEach { chunk ->
             val url = "https://api-v2.soundcloud.com/tracks?ids=${
@@ -202,16 +271,16 @@ class PlaylistImporter(
                 val scId = extractJsonString(obj, "\"id\"") ?: extractJsonNumber(obj, "\"id\"") ?: continue
                 val trackTitle = extractJsonString(obj, "\"title\"") ?: continue
                 val userBlock = extractJsonObjectBlock(obj, "\"user\"")
-                val artist = if (userBlock != null) extractJsonString(userBlock, "\"username\"") else null
+                val artist = if (userBlock != null) extractJsonString(userBlock, "\"username\"") ?: "" else ""
                 val durationMs = extractJsonNumber(obj, "\"duration\"")?.toLongOrNull() ?: 0L
-                val artwork = extractJsonString(obj, "\"artwork_url\"")?.replace("-large.", "-t500x500.")
-                val numericId = AudiusApi.stableIdHash("sc-import:$scId")
+                val artwork = (extractJsonString(obj, "\"artwork_url\"") ?: "")
+                    .takeIf { it.isNotBlank() }?.replace("-large.", "-t500x500.")
                 result += TrackInfo(
-                    id = numericId,
+                    id = AudiusApi.stableIdHash("sc-import:$scId"),
                     providerId = scId,
                     provider = Provider.UNKNOWN,
                     title = trackTitle,
-                    artistName = artist ?: "",
+                    artistName = artist,
                     artworkUrl = artwork,
                     duration = durationMs,
                     isUnplayable = true,
@@ -247,50 +316,41 @@ class PlaylistImporter(
                 isUnplayable = true,
             )
         }
-        return ImportResult.Success(
-            title = name,
-            artworkUrl = image,
-            tracks = tracks,
-            sourceName = "SoundCloud",
-        )
+        return ImportResult.Success(title = name, artworkUrl = image, tracks = tracks, sourceName = "SoundCloud")
     }
 
-    // ---- YouTube ----
+    // =========================================================
+    //  YouTube
+    // =========================================================
 
     private suspend fun importYouTube(url: String): ImportResult {
-        val playlistId = extractYouTubePlaylistId(url)
+        val playlistId = Regex("""[?&]list=([A-Za-z0-9_-]+)""").find(url)?.groupValues?.get(1)
             ?: return ImportResult.Error("YouTube", "URL doesn't look like a YouTube playlist")
         val pl = youTubeApi.getPlaylist(playlistId)
             ?: return ImportResult.Error("YouTube", "Couldn't fetch playlist (Invidious not reachable)")
-        return ImportResult.Success(
-            title = pl.title,
-            artworkUrl = pl.artworkUrl,
-            tracks = pl.tracks,
-            sourceName = "YouTube",
-        )
+        return ImportResult.Success(title = pl.title, artworkUrl = pl.artworkUrl, tracks = pl.tracks, sourceName = "YouTube")
     }
 
-    // ---- JSON helpers ----
+    // =========================================================
+    //  JSON helpers
+    // =========================================================
 
     private fun httpGet(url: String, asBrowser: Boolean): String? {
         val req = Request.Builder()
             .url(url)
             .header("User-Agent", if (asBrowser)
-                "Mozilla/5.0 (Linux; Android 14; OpenSound) AppleWebKit/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             else
-                "OpenSound/0.1 (Android)")
+                "OpenSound/1.0 (Android)")
             .header("Accept", "text/html,application/xhtml+xml,application/json,*/*")
+            .header("Accept-Language", "en-US,en;q=0.9")
             .build()
-        return http.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) null else resp.body?.string()
-        }
+        return http.newCall(req).execute().use { resp -> if (!resp.isSuccessful) null else resp.body?.string() }
     }
 
     private fun extractJsonString(block: String, key: String): String? {
-        val idx = block.indexOf(key)
-        if (idx < 0) return null
-        val colon = block.indexOf(':', idx + key.length)
-        if (colon < 0) return null
+        val idx = block.indexOf(key); if (idx < 0) return null
+        val colon = block.indexOf(':', idx + key.length); if (colon < 0) return null
         var i = colon + 1
         while (i < block.length && block[i].isWhitespace()) i++
         if (i >= block.length || block[i] != '"') return null
@@ -299,60 +359,54 @@ class PlaylistImporter(
         while (i < block.length) {
             val c = block[i]
             if (c == '\\' && i + 1 < block.length) {
-                val n = block[i + 1]
-                when (n) {
-                    'n' -> sb.append('\n')
-                    't' -> sb.append('\t')
-                    'r' -> sb.append('\r')
-                    '\\' -> sb.append('\\')
-                    '/' -> sb.append('/')
-                    '"' -> sb.append('"')
+                when (val n = block[i + 1]) {
+                    'n' -> sb.append('\n'); 't' -> sb.append('\t'); 'r' -> sb.append('\r')
+                    '\\' -> sb.append('\\'); '/' -> sb.append('/'); '"' -> sb.append('"')
                     'u' -> if (i + 5 < block.length) {
-                        runCatching { sb.append(block.substring(i + 2, i + 6).toInt(16).toChar()) }
-                        i += 4
+                        runCatching { sb.append(block.substring(i + 2, i + 6).toInt(16).toChar()) }; i += 4
                     }
                     else -> sb.append(n)
                 }
                 i += 2
-            } else if (c == '"') {
-                return sb.toString()
-            } else {
-                sb.append(c); i++
-            }
+            } else if (c == '"') return sb.toString()
+            else { sb.append(c); i++ }
         }
         return null
     }
 
     private fun extractJsonNumber(block: String, key: String): String? {
-        val idx = block.indexOf(key)
-        if (idx < 0) return null
-        val colon = block.indexOf(':', idx + key.length)
-        if (colon < 0) return null
+        val idx = block.indexOf(key); if (idx < 0) return null
+        val colon = block.indexOf(':', idx + key.length); if (colon < 0) return null
         var i = colon + 1
         while (i < block.length && block[i].isWhitespace()) i++
         if (i >= block.length || (!block[i].isDigit() && block[i] != '-')) return null
         val sb = StringBuilder()
-        while (i < block.length && (block[i].isDigit() || block[i] == '-' || block[i] == '.')) {
-            sb.append(block[i++])
-        }
+        while (i < block.length && (block[i].isDigit() || block[i] == '-' || block[i] == '.')) sb.append(block[i++])
         return sb.toString().ifEmpty { null }
     }
 
     private fun extractJsonObjectBlock(block: String, key: String): String? {
-        val idx = block.indexOf(key)
-        if (idx < 0) return null
-        val colon = block.indexOf(':', idx + key.length)
-        if (colon < 0) return null
+        val idx = block.indexOf(key); if (idx < 0) return null
+        val colon = block.indexOf(':', idx + key.length); if (colon < 0) return null
         var i = colon + 1
         while (i < block.length && block[i].isWhitespace()) i++
         if (i >= block.length || block[i] != '{') return null
-        var depth = 0
-        val sb = StringBuilder()
-        while (i < block.length) {
-            when (block[i]) {
-                '{' -> { depth++; sb.append('{') }
-                '}' -> { depth--; sb.append('}'); if (depth == 0) return sb.toString() }
-                else -> sb.append(block[i])
+        return extractJsonObject(block, i)
+    }
+
+    private fun extractJsonObject(json: String, startIdx: Int): String? {
+        if (startIdx >= json.length || json[startIdx] != '{') return null
+        var depth = 0; val sb = StringBuilder(); var i = startIdx; var inString = false; var escape = false
+        while (i < json.length) {
+            val c = json[i]
+            when {
+                escape -> { sb.append(c); escape = false }
+                c == '\\' && inString -> { sb.append(c); escape = true }
+                c == '"' -> { sb.append(c); inString = !inString }
+                inString -> sb.append(c)
+                c == '{' -> { depth++; sb.append(c) }
+                c == '}' -> { depth--; sb.append(c); if (depth == 0) return sb.toString() }
+                else -> sb.append(c)
             }
             i++
         }
@@ -361,14 +415,17 @@ class PlaylistImporter(
 
     private fun extractJsonArray(json: String, startIdx: Int): String? {
         if (startIdx >= json.length || json[startIdx] != '[') return null
-        var depth = 0
-        val sb = StringBuilder()
-        var i = startIdx
+        var depth = 0; val sb = StringBuilder(); var i = startIdx; var inString = false; var escape = false
         while (i < json.length) {
-            when (json[i]) {
-                '[' -> { depth++; sb.append('[') }
-                ']' -> { depth--; sb.append(']'); if (depth == 0) return sb.toString() }
-                else -> sb.append(json[i])
+            val c = json[i]
+            when {
+                escape -> { sb.append(c); escape = false }
+                c == '\\' && inString -> { sb.append(c); escape = true }
+                c == '"' -> { sb.append(c); inString = !inString }
+                inString -> sb.append(c)
+                c == '[' -> { depth++; sb.append(c) }
+                c == ']' -> { depth--; sb.append(c); if (depth == 0) return sb.toString() }
+                else -> sb.append(c)
             }
             i++
         }
@@ -376,20 +433,11 @@ class PlaylistImporter(
     }
 
     private fun splitJsonObjects(arrayJson: String): List<String> {
-        val objects = mutableListOf<String>()
-        var i = 0
+        val objects = mutableListOf<String>(); var i = 0
         while (i < arrayJson.length) {
             if (arrayJson[i] == '{') {
-                var depth = 0
-                val sb = StringBuilder()
-                while (i < arrayJson.length) {
-                    when (arrayJson[i]) {
-                        '{' -> { depth++; sb.append('{') }
-                        '}' -> { depth--; sb.append('}'); if (depth == 0) { objects += sb.toString(); break } }
-                        else -> sb.append(arrayJson[i])
-                    }
-                    i++
-                }
+                val obj = extractJsonObject(arrayJson, i)
+                if (obj != null) { objects += obj; i += obj.length; continue }
             }
             i++
         }
@@ -405,31 +453,23 @@ class PlaylistImporter(
         return ((h * 3600) + (mi * 60) + s) * 1000L
     }
 
-    private fun extractYouTubePlaylistId(url: String): String? {
-        return Regex("""[?&]list=([A-Za-z0-9_-]+)""").find(url)?.groupValues?.get(1)
-    }
-
     companion object {
         private val SC_JSONLD_RE = Regex(
-            """<script type="application/ld\+json">(\{.+?\})</script>""",
-            RegexOption.DOT_MATCHES_ALL,
-        )
-        // Track blocks — allows one level of nested braces (e.g. byArtist:{...})
+            """<script type="application/ld\+json">(\{.+?\})</script>""", RegexOption.DOT_MATCHES_ALL)
         private val SC_TRACK_BLOCK_RE = Regex(
             """\{(?:[^\{\}]|\{[^\{\}]*\})*?"@type"\s*:\s*"MusicRecording"(?:[^\{\}]|\{[^\{\}]*\})*?\}""",
-            RegexOption.DOT_MATCHES_ALL,
-        )
+            RegexOption.DOT_MATCHES_ALL)
         private val SC_CLIENT_ID_RE = Regex(
-            """client_id\s*[=:]\s*["']([A-Za-z0-9]{20,50})["']""",
-        )
+            """(?:client_id|clientId)\s*[=:]\s*["']([A-Za-z0-9]{20,50})["']""")
+        private val SC_CLIENT_ID_IN_SRC_RE = Regex(
+            """[?&]client_id=([A-Za-z0-9]{20,50})""")
         private val SC_ASSET_URL_RE = Regex(
-            """<script[^>]+src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"""",
-        )
+            """<script[^>]+src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js[^"]*)"""")
         private val ISO_DURATION_RE = Regex("""PT0*([0-9]+)H0*([0-9]+)M0*([0-9]+)S""")
 
         fun defaultHttp(): OkHttpClient = OkHttpClient.Builder()
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .readTimeout(45, TimeUnit.SECONDS)
+            .connectTimeout(25, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .build()

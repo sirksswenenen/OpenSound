@@ -365,12 +365,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 if (playable != null) {
-                    // Prefer original SC metadata (title/artist) over found track's metadata
+                    // Preserve original SC title/artist but use YouTube artwork
+                    // (SC artwork URLs from import may not load without auth)
                     playable.copy(
                         title = t.title.ifBlank { playable.title },
                         artistName = t.artistName.ifBlank { playable.artistName },
-                        artworkUrl = t.artworkUrl ?: playable.artworkUrl,
+                        artworkUrl = playable.artworkUrl ?: t.artworkUrl,
                         duration = if (expectedMs != null && expectedMs > 0) expectedMs else playable.duration,
+                        isUnplayable = false,
                     )
                 } else {
                     t // keep placeholder
