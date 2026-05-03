@@ -225,6 +225,33 @@ class PlayerManager(
     }
 
     /**
+     * Remove the currently-playing track from the queue.
+     * If a next track exists, it starts playing immediately.
+     * If the queue becomes empty, playback stops and the player state is cleared
+     * (which hides the mini-player in the UI).
+     */
+    fun stopAndRemoveCurrent() {
+        val ctl = controller ?: return
+        val cur = _state.value
+        val idx = cur.queueIndex
+        val queue = cur.queue.toMutableList()
+        if (idx < 0 || idx >= queue.size) return
+        queue.removeAt(idx)
+
+        if (queue.isEmpty()) {
+            ctl.stop()
+            ctl.clearMediaItems()
+            stopPositionPolling()
+            _state.value = PlayerState()
+        } else {
+            val nextIdx = idx.coerceAtMost(queue.size - 1)
+            val nextTrack = queue[nextIdx]
+            _state.update { it.copy(queue = queue, queueIndex = nextIdx) }
+            playAtIndex(nextTrack, nextIdx)
+        }
+    }
+
+    /**
      * Shuffle all tracks in the queue in-place, keeping the currently
      * playing track pinned at its current position so playback continues
      * uninterrupted. A second call restores the original order (acts as

@@ -12,6 +12,7 @@ import com.soundcloud.lite.api.YouTubeApi
 import com.soundcloud.lite.api.iTunesApi
 import com.soundcloud.lite.data.AppSettings
 import com.soundcloud.lite.data.Playlist
+import com.soundcloud.lite.data.PlaylistRepository
 import com.soundcloud.lite.data.SettingsRepository
 import com.soundcloud.lite.player.PlayerManager
 import kotlinx.coroutines.Dispatchers
@@ -31,6 +32,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val settingsRepo = SettingsRepository(application)
     val settings: StateFlow<AppSettings> = settingsRepo.settings
+
+    private val playlistRepo = PlaylistRepository(application)
 
     val audiusApi: AudiusApi = AudiusApi()
     val youTubeApi: YouTubeApi = YouTubeApi()
@@ -66,6 +69,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _playlists = MutableStateFlow<List<Playlist>>(emptyList())
     val playlists: StateFlow<List<Playlist>> = _playlists.asStateFlow()
+
+    init {
+        // Load persisted playlists on startup
+        _playlists.value = playlistRepo.loadPlaylists()
+        // Auto-save whenever playlists change
+        viewModelScope.launch(Dispatchers.IO) {
+            _playlists.collect { playlists ->
+                playlistRepo.savePlaylists(playlists)
+            }
+        }
+    }
 
     private val _altSourceState = MutableStateFlow<AltSourceState?>(null)
     val altSourceState: StateFlow<AltSourceState?> = _altSourceState.asStateFlow()
@@ -253,8 +267,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Imports a playlist from a foreign-service URL. Tracks that don't
      *  have a playable provider yet (e.g. SoundCloud-imported tracks)
-     *  are matched against YouTube as a best-effort, with iTunes used
-     *  to clean up the metadata. */
+     *  are matched against YouTube/Audius as a best-effort. */
     fun importPlaylistFromUrl(url: String) {
         if (_importInProgress.value) return
         _importInProgress.value = true
@@ -295,84 +308,76 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * SoundCloud playlist import), search YouTube / Audius for a playable
      * equivalent.
      *
-     * Key improvement over the naive first-result approach: when the source
-     * track has a known duration (from SC JSON-LD), we fetch several YouTube
-     * candidates and pick the one whose duration is closest to the expected
-     * value.  This filters out 30-second previews and short clips that
-     * Invidious sometimes surfaces at the top of search results for
-     * region-locked tracks.
-     *
-     * Matching rules:
-     *   1. Duration must be within ±25 % of the expected value (if known).
-     *   2. Among survivors the closest duration wins.
-     *   3. If nothing survives the duration gate, fall back to Audius.
-     *   4. If Audius also fails, keep the placeholder.
+     * Search strategy uses artist + title when available (from SC API-v2),
+     * with multiple fallback queries if the first doesn't return a duration match.
      */
     private suspend fun resolveImportedTracks(tracks: List<TrackInfo>): List<TrackInfo> = coroutineScope {
         tracks.map { t ->
             async {
                 if (!t.isUnplayable) return@async t
-                val query = t.title.ifBlank { return@async t }
+                if (t.title.isBlank()) return@async t
 
-                // 1) iTunes enrichment: canonical title+artist+artwork
-                val match = runCatching { iTunes.enrich(query) }.getOrNull()
-                val fullQuery = if (match != null) "${match.artist} ${match.title}" else query
+                // Build query variants: (1) artist + title, (2) title only
+                val queries = buildList {
+                    if (t.artistName.isNotBlank()) add("${t.artistName} ${t.title}")
+                    add(t.title)
+                }.distinct()
 
-                // 2) Fetch several YT candidates (more choices → better duration match)
-                val ytCandidates = runCatching {
-                    youTubeApi.search(fullQuery, limit = 8)
-                }.getOrDefault(emptyList())
+                val expectedMs = t.duration.takeIf { it > 5_000L }
 
-                // 3) Duration-aware selection
-                val expectedMs = t.duration.takeIf { it > 5_000L } // ignore if <5 s (missing metadata)
-                val yt: TrackInfo? = if (expectedMs != null && expectedMs > 0) {
-                    val tolerance = expectedMs * 0.25
-                    val filtered = ytCandidates.filter { c ->
-                        c.duration > 0L && kotlin.math.abs(c.duration - expectedMs) <= tolerance
-                    }
-                    (filtered.ifEmpty { null })
-                        ?.minByOrNull { kotlin.math.abs(it.duration - expectedMs) }
-                } else {
-                    // No duration info — trust the first result as before
-                    ytCandidates.firstOrNull()
-                }
+                // Try each query until we find a duration-matching result
+                var playable: TrackInfo? = null
+                for (query in queries) {
+                    if (playable != null) break
 
-                // 4) Audius fallback (also applies best-effort duration check)
-                val playable: TrackInfo? = yt ?: run {
-                    val audiusCandidates = runCatching {
-                        audiusApi.search(fullQuery, limit = 5).tracks
+                    // YouTube candidates
+                    val ytCandidates = runCatching {
+                        youTubeApi.search(query, limit = 10)
                     }.getOrDefault(emptyList())
-                    if (expectedMs != null && expectedMs > 0) {
+
+                    playable = if (expectedMs != null) {
+                        val tolerance = expectedMs * 0.30
+                        val filtered = ytCandidates.filter { c ->
+                            c.duration > 0L && kotlin.math.abs(c.duration - expectedMs) <= tolerance
+                        }
+                        filtered.minByOrNull { kotlin.math.abs(it.duration - expectedMs) }
+                            ?: ytCandidates.firstOrNull() // relax filter as last resort
+                    } else {
+                        ytCandidates.firstOrNull()
+                    }
+
+                    if (playable != null) break
+
+                    // Audius fallback
+                    val audiusCandidates = runCatching {
+                        audiusApi.search(query, limit = 5).tracks
+                    }.getOrDefault(emptyList())
+
+                    playable = if (expectedMs != null) {
                         val tolerance = expectedMs * 0.30
                         val filtered = audiusCandidates.filter { c ->
                             c.duration > 0L && kotlin.math.abs(c.duration - expectedMs) <= tolerance
                         }
-                        (filtered.ifEmpty { audiusCandidates }).firstOrNull()
+                        filtered.minByOrNull { kotlin.math.abs(it.duration - expectedMs) }
                     } else {
                         audiusCandidates.firstOrNull()
                     }
                 }
 
                 if (playable != null) {
+                    // Prefer original SC metadata (title/artist) over found track's metadata
                     playable.copy(
-                        title = match?.title ?: playable.title,
-                        artistName = match?.artist ?: playable.artistName,
-                        artworkUrl = match?.artworkUrl1000 ?: playable.artworkUrl,
-                        genre = match?.genre ?: playable.genre,
+                        title = t.title.ifBlank { playable.title },
+                        artistName = t.artistName.ifBlank { playable.artistName },
+                        artworkUrl = t.artworkUrl ?: playable.artworkUrl,
+                        duration = if (expectedMs != null && expectedMs > 0) expectedMs else playable.duration,
                     )
                 } else {
-                    // No match anywhere — keep the placeholder with clean metadata.
-                    t.copy(
-                        title = match?.title ?: t.title,
-                        artistName = match?.artist ?: t.artistName,
-                        artworkUrl = match?.artworkUrl1000 ?: t.artworkUrl,
-                        isUnplayable = true,
-                    )
+                    t // keep placeholder
                 }
             }
         }.awaitAll()
     }
-
     // ---- Alt sources (placeholder; UI shows a "not available in MVP" dialog) ----
 
     fun openAlternativeSourcesFor(track: TrackInfo, currentPlaylistId: String? = null) {

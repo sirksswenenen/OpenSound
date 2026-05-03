@@ -1,6 +1,5 @@
 package com.soundcloud.lite.ui.screens
 
-import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
@@ -8,17 +7,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material3.Icon
@@ -32,8 +28,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -45,10 +44,10 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import com.soundcloud.lite.api.TrackInfo
 import com.soundcloud.lite.ui.MainViewModel
 import com.soundcloud.lite.ui.components.TrackRow
-import kotlinx.coroutines.launch
 
 @Composable
 fun QueueScreen(
@@ -60,17 +59,31 @@ fun QueueScreen(
     val curIdx = state.queueIndex
     val isQueueShuffled = state.shuffledOrder != null
     val listState = rememberLazyListState()
-
-    // Drag-reorder state
-    var draggingIndex by remember { mutableStateOf<Int?>(null) }
-    var dragOffsetY by remember { mutableStateOf(0f) }
     val density = LocalDensity.current
 
-    // Tracks the top-Y and height of the LazyColumn for edge auto-scroll
+    // Local mutable snapshot of the queue — updated optimistically during drag
+    // so the LazyColumn re-renders in the new order immediately.
+    val localQueue = remember { mutableStateListOf<TrackInfo>() }
+    var localCurIdx by remember { mutableIntStateOf(0) }
+
+    // Sync local state when external state changes (and not dragging).
+    var isDragging by remember { mutableStateOf(false) }
+    LaunchedEffect(queue, curIdx) {
+        if (!isDragging) {
+            localQueue.clear()
+            localQueue.addAll(queue)
+            localCurIdx = curIdx
+        }
+    }
+
+    // Drag state
+    var draggingIndex by remember { mutableStateOf<Int?>(null) }
+    var dragOffsetY by remember { mutableStateOf(0f) }
     var listTopY by remember { mutableStateOf(0f) }
     var listHeightPx by remember { mutableStateOf(0f) }
 
     Column(modifier = Modifier.fillMaxSize()) {
+        // ---- Header ----
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -78,21 +91,18 @@ fun QueueScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = onBack) {
-                Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
             Text(
                 text = "Queue",
                 color = MaterialTheme.colorScheme.onSurface,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.SemiBold,
-                modifier = Modifier
-                    .padding(start = 4.dp)
-                    .weight(1f),
+                modifier = Modifier.padding(start = 4.dp).weight(1f),
             )
-            // Shuffle queue button: first tap shuffles, second restores original order
             IconButton(
                 onClick = { viewModel.playerManager.shuffleQueue() },
-                enabled = queue.size > 1,
+                enabled = localQueue.size > 1,
             ) {
                 Icon(
                     Icons.Filled.Shuffle,
@@ -105,7 +115,7 @@ fun QueueScreen(
             }
         }
 
-        if (queue.isEmpty()) {
+        if (localQueue.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("Queue is empty", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
@@ -124,75 +134,84 @@ fun QueueScreen(
             contentPadding = PaddingValues(bottom = 96.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            itemsIndexed(queue, key = { _, t -> t.id }) { index, track ->
+            itemsIndexed(localQueue, key = { _, t -> t.id }) { index, track ->
+                val currentIndex by rememberUpdatedState(localCurIdx)
+
                 QueueRow(
                     track = track,
-                    isCurrent = index == curIdx,
-                    onPlay = {
-                        viewModel.playerManager.play(track, queue)
-                    },
+                    isCurrent = index == currentIndex,
+                    onPlay = { viewModel.playerManager.play(track, localQueue.toList()) },
                     onSwipeAway = {
-                        if (index != curIdx) {
-                            val next = queue.toMutableList().apply { removeAt(index) }
-                            val newCur = if (index < curIdx) curIdx - 1 else curIdx
-                            viewModel.playerManager.setQueue(next, newCur.coerceAtLeast(0))
+                        if (index == currentIndex) {
+                            // Swiping current track: stop and advance or clear
+                            viewModel.playerManager.stopAndRemoveCurrent()
+                        } else {
+                            val newQueue = localQueue.toMutableList().apply { removeAt(index) }
+                            val newCur = when {
+                                index < currentIndex -> currentIndex - 1
+                                else -> currentIndex
+                            }.coerceAtLeast(0)
+                            localQueue.clear()
+                            localQueue.addAll(newQueue)
+                            localCurIdx = newCur
+                            viewModel.playerManager.setQueue(newQueue, newCur)
                         }
                     },
                     onDragStart = {
+                        isDragging = true
                         draggingIndex = index
                         dragOffsetY = 0f
                     },
                     onDrag = { delta, pointerYInRoot ->
                         dragOffsetY += delta
 
-                        // --- Edge auto-scroll ---
+                        // Edge auto-scroll
                         val edgeZone = with(density) { 72.dp.toPx() }
                         val relY = pointerYInRoot - listTopY
                         val scrollSpeed = when {
-                            relY < edgeZone && relY >= 0 ->
-                                -((edgeZone - relY) / edgeZone * 18f)
+                            relY < edgeZone && relY >= 0 -> -((edgeZone - relY) / edgeZone * 18f)
                             relY > listHeightPx - edgeZone && relY <= listHeightPx ->
                                 ((relY - (listHeightPx - edgeZone)) / edgeZone * 18f)
                             else -> 0f
                         }
-                        if (scrollSpeed != 0f) {
-                            listState.dispatchRawDelta(scrollSpeed)
-                        }
+                        if (scrollSpeed != 0f) listState.dispatchRawDelta(scrollSpeed)
 
-                        // --- Reorder when drag crosses an item boundary (~64dp) ---
-                        val rowPx = with(density) { 64.dp.toPx() }
-                        val moved = (dragOffsetY / rowPx).toInt()
-                        if (moved != 0) {
+                        // Reorder when drag crosses an item boundary (~68dp)
+                        val rowPx = with(density) { 68.dp.toPx() }
+                        val steps = (dragOffsetY / rowPx).toInt()
+                        if (steps != 0) {
                             val from = draggingIndex ?: return@QueueRow
-                            val to = (from + moved).coerceIn(0, queue.size - 1)
+                            val to = (from + steps).coerceIn(0, localQueue.size - 1)
                             if (to != from) {
-                                val next = queue.toMutableList().apply {
-                                    val item = removeAt(from)
-                                    add(to, item)
+                                val item = localQueue.removeAt(from)
+                                localQueue.add(to, item)
+                                localCurIdx = when {
+                                    from == localCurIdx -> to
+                                    from < localCurIdx && to >= localCurIdx -> localCurIdx - 1
+                                    from > localCurIdx && to <= localCurIdx -> localCurIdx + 1
+                                    else -> localCurIdx
                                 }
-                                val newCur = when {
-                                    from == curIdx -> to
-                                    from < curIdx && to >= curIdx -> curIdx - 1
-                                    from > curIdx && to <= curIdx -> curIdx + 1
-                                    else -> curIdx
-                                }
-                                viewModel.playerManager.setQueue(next, newCur)
                                 draggingIndex = to
-                                dragOffsetY -= moved * rowPx
+                                dragOffsetY -= steps * rowPx
                             }
                         }
                     },
                     onDragEnd = {
+                        isDragging = false
+                        // Commit the reordered queue to the player
+                        viewModel.playerManager.setQueue(localQueue.toList(), localCurIdx)
                         draggingIndex = null
                         dragOffsetY = 0f
                     },
                     isDragging = draggingIndex == index,
                     dragOffsetY = if (draggingIndex == index) dragOffsetY else 0f,
-                    modifier = Modifier.animateItem(
-                        fadeInSpec = null,
-                        fadeOutSpec = null,
-                        placementSpec = spring(stiffness = 400f, dampingRatio = 0.8f),
-                    ),
+                    modifier = if (draggingIndex == index)
+                        Modifier.zIndex(1f)
+                    else
+                        Modifier.animateItem(
+                            fadeInSpec = null,
+                            fadeOutSpec = null,
+                        ),
                 )
             }
         }
@@ -212,10 +231,8 @@ private fun QueueRow(
     dragOffsetY: Float,
     modifier: Modifier = Modifier,
 ) {
-    // Swipe-to-dismiss: require 65% drag before committing — prevents
-    // accidental removal from a tiny flick (was 50% before).
     val dismissState = rememberSwipeToDismissBoxState(
-        positionalThreshold = { totalDistance -> totalDistance * 0.65f },
+        positionalThreshold = { totalDistance -> totalDistance * 0.40f },
     )
     LaunchedEffect(dismissState.currentValue) {
         if (dismissState.currentValue != SwipeToDismissBoxValue.Settled) {
@@ -228,44 +245,30 @@ private fun QueueRow(
         state = dismissState,
         modifier = modifier,
         backgroundContent = {
-            // Show a delete indicator only on the side the user is swiping
-            // toward, constrained to the far edge so it never peeks under
-            // the track artwork.
-            val alignment = when (dismissState.dismissDirection) {
-                SwipeToDismissBoxValue.StartToEnd -> Alignment.CenterStart
-                SwipeToDismissBoxValue.EndToStart -> Alignment.CenterEnd
-                else -> Alignment.CenterEnd
-            }
-            val fraction = (dismissState.progress).coerceIn(0f, 1f)
+            // Only show background color when actually swiping — avoid
+            // red flash when progress is exactly 0 (settled state).
+            val fraction = dismissState.progress.coerceIn(0f, 1f)
+            val alpha = if (fraction > 0.01f) (fraction * 2f).coerceIn(0f, 1f) else 0f
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(
-                        MaterialTheme.colorScheme.errorContainer.copy(
-                            alpha = (fraction * 1.5f).coerceIn(0f, 1f)
-                        )
+                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = alpha)
                     ),
-                contentAlignment = alignment,
-            ) {
-                Icon(
-                    Icons.Filled.Delete,
-                    contentDescription = "Remove",
-                    tint = MaterialTheme.colorScheme.onErrorContainer,
-                    modifier = Modifier.padding(horizontal = 20.dp),
-                )
-            }
+            )
         },
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surface)
                 .graphicsLayer {
                     if (isDragging) {
                         translationY = dragOffsetY
-                        shadowElevation = 12f
+                        shadowElevation = 16f
                         scaleX = 1.02f
                         scaleY = 1.02f
-                        alpha = 0.92f
+                        alpha = 0.95f
                     }
                 },
             verticalAlignment = Alignment.CenterVertically,
@@ -275,7 +278,6 @@ private fun QueueRow(
                 modifier = Modifier.weight(1f),
                 onClick = onPlay,
             )
-            // Drag handle — tracks pointer Y in root coords for auto-scroll
             var handleRootY by remember { mutableStateOf(0f) }
             IconButton(
                 onClick = {},
@@ -287,6 +289,7 @@ private fun QueueRow(
                         detectDragGesturesAfterLongPress(
                             onDragStart = { onDragStart() },
                             onDrag = { change, drag ->
+                                change.consume()
                                 handleRootY += drag.y
                                 onDrag(drag.y, handleRootY)
                             },
