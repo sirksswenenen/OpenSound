@@ -128,7 +128,7 @@ class PlaylistImporter(
             // No client_id — add placeholders so the track count is right
             for (id in missingIds) {
                 tracks += TrackInfo(
-                    id = AudiusApi.stableIdHash("sc-import:$id"),
+                    id = scIdToLong("$id"),
                     providerId = id,
                     provider = Provider.UNKNOWN,
                     title = "Track $id",
@@ -142,7 +142,7 @@ class PlaylistImporter(
         return ImportResult.Success(
             title = hr.title,
             artworkUrl = hr.artworkUrl,
-            tracks = tracks,
+            tracks = deduplicateIds(tracks),
             sourceName = "SoundCloud",
         )
     }
@@ -191,7 +191,7 @@ class PlaylistImporter(
                 .takeIf { it.isNotBlank() }
                 ?.replace("-large.", "-t500x500.")
             fullTracks += TrackInfo(
-                id = AudiusApi.stableIdHash("sc-import:$scId"),
+                id = scIdToLong("$scId"),
                 providerId = scId,
                 provider = Provider.UNKNOWN,
                 title = trackTitle,
@@ -276,7 +276,7 @@ class PlaylistImporter(
                 val artwork = (extractJsonString(obj, "\"artwork_url\"") ?: "")
                     .takeIf { it.isNotBlank() }?.replace("-large.", "-t500x500.")
                 result += TrackInfo(
-                    id = AudiusApi.stableIdHash("sc-import:$scId"),
+                    id = scIdToLong("$scId"),
                     providerId = scId,
                     provider = Provider.UNKNOWN,
                     title = trackTitle,
@@ -305,7 +305,7 @@ class PlaylistImporter(
             val durationMs = parseIsoDurationMs(durationIso)
             val byArtistBlock = extractJsonObjectBlock(block, "\"byArtist\"")
             val artistName = if (byArtistBlock != null) extractJsonString(byArtistBlock, "\"name\"") ?: "" else ""
-            val numericId = AudiusApi.stableIdHash("sc-import:${scId ?: title}")
+            val numericId = scIdToLong(scId ?: AudiusApi.stableIdHash(title.hashCode().toString()).toString())
             tracks += TrackInfo(
                 id = numericId,
                 providerId = scId ?: "",
@@ -316,7 +316,7 @@ class PlaylistImporter(
                 isUnplayable = true,
             )
         }
-        return ImportResult.Success(title = name, artworkUrl = image, tracks = tracks, sourceName = "SoundCloud")
+        return ImportResult.Success(title = name, artworkUrl = image, tracks = deduplicateIds(tracks), sourceName = "SoundCloud")
     }
 
     // =========================================================
@@ -473,5 +473,27 @@ class PlaylistImporter(
             .followRedirects(true)
             .followSslRedirects(true)
             .build()
+
+        /**
+         * SC track IDs are numeric strings (e.g. "1234567890").
+         * Use them directly as Long to guarantee uniqueness — no hash collisions.
+         * For non-numeric IDs (shouldn't happen but just in case) fall back to FNV hash.
+         */
+        fun scIdToLong(scId: String): Long =
+            scId.toLongOrNull() ?: AudiusApi.stableIdHash("sc-import:$scId")
+
+        /**
+         * After building a track list, ensure every id is unique.
+         * If two tracks ended up with the same id (e.g. hash collision on non-numeric ids),
+         * offset subsequent duplicates by their list position.
+         */
+        fun deduplicateIds(tracks: List<TrackInfo>): List<TrackInfo> {
+            val seen = mutableSetOf<Long>()
+            return tracks.mapIndexed { idx, t ->
+                var id = t.id
+                while (!seen.add(id)) id = id xor (idx.toLong() + 1L)
+                if (id == t.id) t else t.copy(id = id)
+            }
+        }
     }
 }

@@ -1,5 +1,6 @@
 package com.soundcloud.lite.ui.screens
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,6 +15,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ContentPaste
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material3.AlertDialog
@@ -23,9 +25,13 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SwipeToDismissBox
+import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -34,10 +40,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.soundcloud.lite.data.Playlist
 import com.soundcloud.lite.ui.MainViewModel
 
 @Composable
@@ -51,6 +57,7 @@ fun PlaylistsScreen(
     var showImport by remember { mutableStateOf(false) }
     var newTitle by remember { mutableStateOf("") }
     var importUrl by remember { mutableStateOf("") }
+    var confirmDeletePlaylist by remember { mutableStateOf<Playlist?>(null) }
     val clipboard = LocalClipboardManager.current
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -75,26 +82,74 @@ fun PlaylistsScreen(
             LazyColumn(
                 modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
                 contentPadding = PaddingValues(top = 12.dp, bottom = 96.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 items(playlists, key = { it.id }) { p ->
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onOpenPlaylist(p.id) }
-                            .padding(vertical = 8.dp),
+                    val dismissState = rememberSwipeToDismissBoxState(
+                        positionalThreshold = { total -> total * 0.4f },
+                    )
+                    LaunchedEffect(dismissState.currentValue) {
+                        if (dismissState.currentValue != SwipeToDismissBoxValue.Settled) {
+                            confirmDeletePlaylist = p
+                            dismissState.reset()
+                        }
+                    }
+
+                    SwipeToDismissBox(
+                        state = dismissState,
+                        modifier = Modifier.animateItem(),
+                        backgroundContent = {
+                            val fraction = dismissState.progress.coerceIn(0f, 1f)
+                            val alpha = if (fraction > 0.02f) (fraction * 2f).coerceAtMost(1f) else 0f
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(
+                                        MaterialTheme.colorScheme.errorContainer.copy(alpha = alpha)
+                                    )
+                                    .padding(horizontal = 20.dp),
+                                contentAlignment = if (dismissState.dismissDirection == SwipeToDismissBoxValue.EndToStart)
+                                    Alignment.CenterEnd else Alignment.CenterStart,
+                            ) {
+                                if (alpha > 0.1f) {
+                                    Icon(
+                                        Icons.Filled.Delete,
+                                        contentDescription = "Delete",
+                                        tint = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = alpha),
+                                    )
+                                }
+                            }
+                        },
                     ) {
-                        Text(
-                            text = p.title,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            fontWeight = FontWeight.Medium,
-                            fontSize = 16.sp,
-                        )
-                        Text(
-                            text = "${p.tracks.size} tracks",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontSize = 12.sp,
-                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.surface)
+                                .clickable { onOpenPlaylist(p.id) }
+                                .padding(vertical = 10.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = p.title,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    fontWeight = FontWeight.Medium,
+                                    fontSize = 16.sp,
+                                )
+                                Text(
+                                    text = "${p.tracks.size} tracks",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontSize = 12.sp,
+                                )
+                            }
+                            IconButton(onClick = { confirmDeletePlaylist = p }) {
+                                Icon(
+                                    Icons.Filled.Delete,
+                                    contentDescription = "Delete playlist",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -122,6 +177,27 @@ fun PlaylistsScreen(
         }
     }
 
+    // ── Confirm delete dialog ────────────────────────────────────────────────
+    confirmDeletePlaylist?.let { pl ->
+        AlertDialog(
+            onDismissRequest = { confirmDeletePlaylist = null },
+            title = { Text("Delete playlist?") },
+            text = { Text("\"${pl.title}\" will be permanently deleted.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.deletePlaylist(pl.id)
+                        confirmDeletePlaylist = null
+                    },
+                ) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDeletePlaylist = null }) { Text("Cancel") }
+            },
+        )
+    }
+
+    // ── Create playlist dialog ───────────────────────────────────────────────
     if (showCreate) {
         AlertDialog(
             onDismissRequest = { showCreate = false },
@@ -146,6 +222,7 @@ fun PlaylistsScreen(
         )
     }
 
+    // ── Import playlist dialog ───────────────────────────────────────────────
     if (showImport) {
         AlertDialog(
             onDismissRequest = { if (!importInProgress) showImport = false },
@@ -153,7 +230,7 @@ fun PlaylistsScreen(
             text = {
                 Column {
                     Text(
-                        text = "Paste a SoundCloud or YouTube playlist URL. The app will look up each track on Audius/YouTube to make it playable.",
+                        text = "Paste a SoundCloud or YouTube playlist URL.",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontSize = 12.sp,
                         modifier = Modifier.padding(bottom = 8.dp),
@@ -169,7 +246,7 @@ fun PlaylistsScreen(
                         IconButton(onClick = {
                             importUrl = clipboard.getText()?.text.orEmpty()
                         }) {
-                            Icon(Icons.Filled.ContentPaste, contentDescription = "Paste from clipboard")
+                            Icon(Icons.Filled.ContentPaste, contentDescription = "Paste")
                         }
                     }
                     if (importInProgress) {
@@ -179,7 +256,7 @@ fun PlaylistsScreen(
                         ) {
                             CircularProgressIndicator(modifier = Modifier.padding(end = 12.dp))
                             Text(
-                                text = "Importing… (matching tracks via YouTube + iTunes)",
+                                text = "Importing… matching tracks via Audius & YouTube",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontSize = 12.sp,
                             )
@@ -192,17 +269,14 @@ fun PlaylistsScreen(
                     enabled = !importInProgress && importUrl.isNotBlank(),
                     onClick = {
                         viewModel.importPlaylistFromUrl(importUrl.trim())
-                        // Stay open so the user sees the spinner; close on
-                        // toast (the result is delivered via _toast).
                         showImport = false
                     },
                 ) { Text("Import") }
             },
             dismissButton = {
-                TextButton(
-                    enabled = !importInProgress,
-                    onClick = { showImport = false },
-                ) { Text("Cancel") }
+                TextButton(enabled = !importInProgress, onClick = { showImport = false }) {
+                    Text("Cancel")
+                }
             },
         )
     }
