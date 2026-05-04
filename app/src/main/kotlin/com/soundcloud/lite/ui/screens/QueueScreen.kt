@@ -90,9 +90,21 @@ fun QueueScreen(
     // Sync from player state only when not dragging
     LaunchedEffect(playerQueue, playerCurIdx) {
         if (draggingId == null) {
+            // Deduplicate by id — prevents LazyColumn duplicate-key crash if
+            // two tracks somehow ended up with the same Long id
+            val deduped = playerQueue.mapIndexed { idx, t ->
+                t
+            }.let { list ->
+                val seen = mutableSetOf<Long>()
+                list.mapIndexed { idx, t ->
+                    var id = t.id
+                    while (!seen.add(id)) id = id xor ((idx + 1L) * 0x9e3779b97f4a7c15L)
+                    if (id == t.id) t else t.copy(id = id)
+                }
+            }
             localQueue.clear()
-            localQueue.addAll(playerQueue)
-            localCurId = playerQueue.getOrNull(playerCurIdx)?.id ?: -1L
+            localQueue.addAll(deduped)
+            localCurId = deduped.getOrNull(playerCurIdx)?.id ?: -1L
         }
     }
 

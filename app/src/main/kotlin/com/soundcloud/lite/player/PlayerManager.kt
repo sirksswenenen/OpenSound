@@ -38,10 +38,19 @@ class PlayerManager(
     private val youtube: YouTubeApi,
 ) {
 
-    private fun resolveStreamUrl(track: TrackInfo): String? = when (track.provider) {
-        Provider.AUDIUS -> if (track.providerId.isNotBlank()) audius.streamUrl(track.providerId) else null
-        Provider.YOUTUBE -> if (track.providerId.isNotBlank()) youtube.streamUrl(track.providerId) else null
-        Provider.UNKNOWN -> null
+    fun resolveStreamUrlPublic(track: TrackInfo): String? = resolveStreamUrl(track)
+
+    /** Injected by MainActivity/ViewModel after construction. */
+    var downloadRepo: com.soundcloud.lite.data.DownloadRepository? = null
+
+    private fun resolveStreamUrl(track: TrackInfo): String? {
+        // Prefer local file if available
+        downloadRepo?.getLocalPath(track.id)?.let { return "file://$it" }
+        return when (track.provider) {
+            Provider.AUDIUS -> if (track.providerId.isNotBlank()) audius.streamUrl(track.providerId) else null
+            Provider.YOUTUBE -> if (track.providerId.isNotBlank()) youtube.streamUrl(track.providerId) else null
+            Provider.UNKNOWN -> null
+        }
     }
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 

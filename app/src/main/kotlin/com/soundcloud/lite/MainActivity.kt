@@ -148,45 +148,8 @@ class MainActivity : ComponentActivity() {
         // of this build so users coming from a previous broken APK
         // don't immediately crash again on launch.
         val prefs = getSharedPreferences("sclite_settings", MODE_PRIVATE)
-        val migrationKey = "lg_safe_v3"
-        if (!prefs.getBoolean(migrationKey, false)) {
-            prefs.edit()
-                .putBoolean("liquid_glass", false)
-                .putBoolean(migrationKey, true)
-                .commit()
-        }
-        // Clean-exit tracker. The previous design used a 4-second
-        // sentinel which is fragile: if the GPU crashes when the user
-        // navigates to a heavy screen 30 seconds in, we already
-        // deleted the sentinel and the next boot re-enables Liquid
-        // Glass — infinite loop. New design: at every launch with LG
-        // on we set "lg_dirty=true". We reset to false in [onStop]
-        // (which runs before process death on every graceful path —
-        // home/back/recents). If we boot and find lg_dirty=true, the
-        // previous run was force-killed and we disable LG. Combined
-        // with the existing JVM CrashLogger this catches both native
-        // and managed failures.
-        val lgWasOn = prefs.getBoolean("liquid_glass", false)
-        val lgDirty = prefs.getBoolean("lg_dirty", false)
-        if (lgWasOn && lgDirty) {
-            prefs.edit()
-                .putBoolean("liquid_glass", false)
-                .putBoolean("lg_disabled_due_to_crash", true)
-                .putBoolean("lg_dirty", false)
-                .commit()
-            android.util.Log.w("SCLiteBoot", "lg auto-disabled: dirty exit on previous run")
-        } else if (pendingCrash != null && lgWasOn) {
-            prefs.edit()
-                .putBoolean("liquid_glass", false)
-                .putBoolean("lg_disabled_due_to_crash", true)
-                .putBoolean("lg_dirty", false)
-                .commit()
-            android.util.Log.w("SCLiteBoot", "lg auto-disabled: pending JVM crash")
-        }
-        // If LG is (still) on at this point, mark dirty until onStop.
-        if (prefs.getBoolean("liquid_glass", false)) {
-            prefs.edit().putBoolean("lg_dirty", true).commit()
-        }
+        // LG crash auto-disable removed per user request — Liquid Glass stays on
+        // regardless of previous crash/dirty-exit state.
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
         maybeRequestNotificationPermission()
@@ -233,13 +196,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        // Clear the dirty bit on the way out — any process death from
-        // here on (recents-swipe, OOM, foreground service shutdown) is
-        // safe and shouldn't trigger Liquid Glass disable on next boot.
-        try {
-            getSharedPreferences("sclite_settings", MODE_PRIVATE)
-                .edit().putBoolean("lg_dirty", false).commit()
-        } catch (_: Throwable) {}
     }
 
     /**

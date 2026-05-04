@@ -8,12 +8,16 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -37,6 +41,7 @@ fun PlaylistDetailScreen(
 ) {
     val playlists by viewModel.playlists.collectAsState()
     val playlist = playlists.firstOrNull { it.id == playlistId }
+    val downloads by viewModel.downloads.collectAsState()
     if (playlist == null) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text("Playlist not found", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -86,6 +91,8 @@ fun PlaylistDetailScreen(
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 items(playlist.tracks, key = { it.id }) { t ->
+                    val isDownloaded = downloads.any { it.track.id == t.id && it.status == com.soundcloud.lite.data.DownloadStatus.DONE }
+                    val isDownloading = downloads.any { it.track.id == t.id && it.status == com.soundcloud.lite.data.DownloadStatus.DOWNLOADING }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -95,8 +102,27 @@ fun PlaylistDetailScreen(
                             modifier = Modifier.weight(1f),
                             onClick = { viewModel.playerManager.play(t, playlist.tracks) },
                         )
+                        if (!t.isUnplayable) {
+                            when {
+                                isDownloading -> {
+                                    val dt = downloads.first { it.track.id == t.id }
+                                    CircularProgressIndicator(
+                                        progress = { dt.progress / 100f },
+                                        modifier = Modifier.padding(horizontal = 12.dp).size(20.dp),
+                                        strokeWidth = 2.dp,
+                                    )
+                                }
+                                isDownloaded -> IconButton(onClick = { viewModel.removeDownload(t.id) }) {
+                                    Icon(Icons.Filled.DownloadDone, contentDescription = "Remove download",
+                                        tint = MaterialTheme.colorScheme.primary)
+                                }
+                                else -> IconButton(onClick = { viewModel.downloadTrack(t) }) {
+                                    Icon(Icons.Filled.Download, contentDescription = "Download")
+                                }
+                            }
+                        }
                         IconButton(onClick = { viewModel.removeFromPlaylist(playlist.id, t.id) }) {
-                            Icon(Icons.Filled.Delete, contentDescription = "Remove")
+                            Icon(Icons.Filled.Delete, contentDescription = "Remove from playlist")
                         }
                     }
                 }

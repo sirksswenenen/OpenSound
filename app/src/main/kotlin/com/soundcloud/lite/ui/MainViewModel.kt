@@ -11,6 +11,7 @@ import com.soundcloud.lite.api.TrackInfo
 import com.soundcloud.lite.api.YouTubeApi
 import com.soundcloud.lite.api.iTunesApi
 import com.soundcloud.lite.data.AppSettings
+import com.soundcloud.lite.data.DownloadRepository
 import com.soundcloud.lite.data.Playlist
 import com.soundcloud.lite.data.PlaylistRepository
 import com.soundcloud.lite.data.SettingsRepository
@@ -34,6 +35,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val settings: StateFlow<AppSettings> = settingsRepo.settings
 
     private val playlistRepo = PlaylistRepository(application)
+    val downloadRepo = DownloadRepository(application)
+    val downloads = downloadRepo.downloads
 
     val audiusApi: AudiusApi = AudiusApi()
     val youTubeApi: YouTubeApi = YouTubeApi()
@@ -79,6 +82,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 playlistRepo.savePlaylists(playlists)
             }
         }
+        // Give the player access to local downloads so it uses file:// URLs
+        playerManager.downloadRepo = downloadRepo
     }
 
     private val _altSourceState = MutableStateFlow<AltSourceState?>(null)
@@ -283,16 +288,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     is PlaylistImporter.ImportResult.Success -> {
                         val resolvedTracks = withContext(Dispatchers.IO) { resolveImportedTracks(result.tracks) }
-                        rememberProviderIds(resolvedTracks)
+                        // CRITICAL: deduplicate by id — two SC tracks might resolve
+                        // to the same Audius/YouTube track giving them the same Long id,
+                        // which causes LazyColumn "duplicate key" crash.
+                        val deduplicated = deduplicateByLongId(resolvedTracks)
+                        rememberProviderIds(deduplicated)
                         val pl = Playlist(
                             id = "import:" + java.util.UUID.randomUUID().toString().take(8),
                             title = result.title,
-                            tracks = resolvedTracks,
+                            tracks = deduplicated,
                             artworkUrl = result.artworkUrl,
                         )
                         _playlists.update { it + pl }
-                        val matched = resolvedTracks.count { !it.isUnplayable }
-                        _toast.value = "Imported '${result.title}' (${matched}/${resolvedTracks.size} playable)"
+                        val matched = deduplicated.count { !it.isUnplayable }
+                        _toast.value = "Imported '${result.title}' (${matched}/${deduplicated.size} playable)"
                     }
                 }
             } catch (t: Throwable) {
@@ -304,80 +313,152 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * For each unplayable placeholder track, find a matching playable track
-     * on Audius (primary) or YouTube/Invidious (fallback).
+     * Deduplicates a track list by `id` (Long). When two tracks collide
+     * (e.g. both SC tracks resolved to the same Audius track), the second
+     * one gets a slight XOR offset so LazyColumn never sees the same key twice.
+     */
+    private fun deduplicateByLongId(tracks: List<TrackInfo>): List<TrackInfo> {
+        val seen = mutableSetOf<Long>()
+        return tracks.mapIndexed { idx, t ->
+            var id = t.id
+            while (!seen.add(id)) id = id xor ((idx + 1L) * 0x9e3779b97f4a7c15L)
+            if (id == t.id) t else t.copy(id = id)
+        }
+    }
+
+    /**
+     * For each unplayable placeholder track, find a matching playable track.
      *
-     * Audius is tried first — it's more reliable than Invidious, needs no
-     * external proxy, and covers most popular tracks. Invidious only fires
-     * if Audius comes back empty.
-     *
-     * Requests are batched in groups of 10 to avoid hammering the APIs.
+     * Priority: Audius (fast, no proxy) → YouTube/Invidious (fallback).
+     * Matching: prefer exact title+artist, penalise remix/cover/live/karaoke
+     * unless the original title also contains those words.
+     * Processed in batches of 8 on IO dispatcher.
      */
     private suspend fun resolveImportedTracks(tracks: List<TrackInfo>): List<TrackInfo> = coroutineScope {
-        tracks.chunked(10).map { chunk ->
+        tracks.chunked(8).map { chunk ->
             chunk.map { t ->
                 async(Dispatchers.IO) {
                     if (!t.isUnplayable) return@async t
                     if (t.title.isBlank()) return@async t
 
                     val expectedMs = t.duration.takeIf { it > 5_000L }
+                    val titleLower = t.title.lowercase()
+                    val artistLower = t.artistName.lowercase()
 
-                    // Build search queries: (1) "Artist Title", (2) "Title"
+                    // Build search queries: precise first, title-only fallback
                     val queries = buildList {
                         if (t.artistName.isNotBlank()) add("${t.artistName} ${t.title}")
                         add(t.title)
                     }.distinct()
 
-                    // Helper: pick best candidate by duration proximity
+                    // Tags that indicate a non-original version (only penalised if
+                    // the ORIGINAL title doesn't contain them)
+                    val badTags = listOf("remix", "cover", "karaoke", "live", "acoustic",
+                        "instrumental", "tribute", "mashup", "bootleg")
+                    val originalHasTags = badTags.filter { titleLower.contains(it) }.toSet()
+
+                    fun score(c: TrackInfo): Int {
+                        var s = 0
+                        val ct = c.title.lowercase()
+                        val ca = c.artistName.lowercase()
+                        // Title similarity
+                        if (ct.contains(titleLower) || titleLower.contains(ct)) s += 30
+                        // Artist match
+                        if (artistLower.isNotBlank() && (ca.contains(artistLower) || artistLower.contains(ca))) s += 20
+                        // Penalise unwanted tags not in original
+                        for (tag in badTags) {
+                            if (ct.contains(tag) && tag !in originalHasTags) s -= 25
+                        }
+                        // Duration proximity bonus (if known)
+                        if (expectedMs != null && c.duration > 0L) {
+                            val diff = kotlin.math.abs(c.duration - expectedMs)
+                            val pct = diff.toDouble() / expectedMs
+                            s += when {
+                                pct < 0.05 -> 20
+                                pct < 0.15 -> 10
+                                pct < 0.30 -> 5
+                                pct < 0.50 -> 0
+                                else -> -15
+                            }
+                        }
+                        return s
+                    }
+
                     fun bestMatch(candidates: List<TrackInfo>): TrackInfo? {
                         if (candidates.isEmpty()) return null
-                        if (expectedMs == null) return candidates.first()
-                        val tolerance = expectedMs * 0.35
-                        return candidates
-                            .filter { it.duration > 0L && kotlin.math.abs(it.duration - expectedMs) <= tolerance }
-                            .minByOrNull { kotlin.math.abs(it.duration - expectedMs) }
-                            ?: candidates.first() // relax: take first if nothing in tolerance
+                        val scored = candidates.map { it to score(it) }
+                        val best = scored.maxByOrNull { it.second }
+                        // Reject if score is deeply negative (very wrong track)
+                        return if ((best?.second ?: -999) > -20) best?.first else null
                     }
 
                     var playable: TrackInfo? = null
 
                     for (query in queries) {
-                        // ── 1. Audius (primary, most reliable) ──────────────
-                        if (playable == null) {
-                            val candidates = runCatching {
-                                audiusApi.search(query, limit = 8).tracks
-                            }.getOrDefault(emptyList())
-                            playable = bestMatch(candidates)
-                        }
+                        if (playable != null) break
 
-                        // ── 2. YouTube via Invidious (fallback) ──────────────
+                        // 1. Audius
+                        val audiusCandidates = runCatching {
+                            audiusApi.search(query, limit = 10).tracks
+                        }.getOrDefault(emptyList())
+                        playable = bestMatch(audiusCandidates)
+
+                        // 2. YouTube/Invidious
                         if (playable == null) {
-                            val candidates = runCatching {
+                            val ytCandidates = runCatching {
                                 youTubeApi.search(query, limit = 10)
                             }.getOrDefault(emptyList())
-                            playable = bestMatch(candidates)
+                            playable = bestMatch(ytCandidates)
                         }
-
-                        if (playable != null) break
                     }
 
                     if (playable != null) {
                         playable.copy(
-                            // Prefer SC title/artist (more accurate for the playlist context)
                             title = t.title.ifBlank { playable.title },
                             artistName = t.artistName.ifBlank { playable.artistName },
-                            // Use provider's artwork (reliable CDN), fall back to SC artwork
+                            // Use provider's artwork URL (public CDN, no auth)
                             artworkUrl = playable.artworkUrl ?: t.artworkUrl,
                             duration = if (expectedMs != null && expectedMs > 0) expectedMs else playable.duration,
                             isUnplayable = false,
                         )
                     } else {
-                        t // keep placeholder
+                        t
                     }
                 }
             }.awaitAll()
         }.flatten()
     }
+    // ---- Downloads ----
+
+    fun downloadTrack(track: TrackInfo) {
+        if (track.isUnplayable) { _toast.value = "Track has no playable source to download."; return }
+        if (downloadRepo.isDownloaded(track.id)) { _toast.value = "Already downloaded."; return }
+        viewModelScope.launch {
+            _toast.value = "Starting download: ${track.title}"
+            val streamUrl = withContext(Dispatchers.IO) {
+                when (track.provider) {
+                    com.soundcloud.lite.api.Provider.AUDIUS ->
+                        if (track.providerId.isNotBlank()) playerManager.resolveStreamUrlPublic(track) else null
+                    com.soundcloud.lite.api.Provider.YOUTUBE ->
+                        if (track.providerId.isNotBlank()) playerManager.resolveStreamUrlPublic(track) else null
+                    else -> null
+                }
+            }
+            if (streamUrl == null) { _toast.value = "Could not resolve stream for download."; return@launch }
+            val path = downloadRepo.download(track, streamUrl)
+            if (path != null) {
+                _toast.value = "Downloaded: ${track.title}"
+            } else {
+                _toast.value = "Download failed: ${track.title}"
+            }
+        }
+    }
+
+    fun removeDownload(trackId: Long) {
+        downloadRepo.removeDownload(trackId)
+        _toast.value = "Download removed."
+    }
+
     // ---- Alt sources (placeholder; UI shows a "not available in MVP" dialog) ----
 
     fun openAlternativeSourcesFor(track: TrackInfo, currentPlaylistId: String? = null) {

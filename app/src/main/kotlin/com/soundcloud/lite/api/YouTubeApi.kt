@@ -29,8 +29,20 @@ class YouTubeApi(
 
     suspend fun search(query: String, limit: Int = 25): List<TrackInfo> {
         val q = percentEncode(query)
-        val body = httpGetWithFallback("/api/v1/search?q=$q&type=video")
-            ?: return emptyList()
+        val path = "/api/v1/search?q=$q&type=video"
+        // Try preferred instance first (fast path)
+        val preferred = preferredInstance
+        if (preferred != null) {
+            try {
+                val body = httpGet("$preferred$path")
+                if (body != null) {
+                    val list = videoListAdapter.fromJson(body)
+                    if (!list.isNullOrEmpty()) return list.take(limit).mapNotNull { it.toTrackInfo() }
+                }
+            } catch (_: Throwable) { preferredInstance = null }
+        }
+        // Fallback: try remaining instances, take first that responds
+        val body = httpGetWithFallback(path) ?: return emptyList()
         val list = videoListAdapter.fromJson(body) ?: return emptyList()
         return list.take(limit).mapNotNull { it.toTrackInfo() }
     }
