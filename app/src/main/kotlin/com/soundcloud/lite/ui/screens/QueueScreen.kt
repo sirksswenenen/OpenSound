@@ -52,7 +52,6 @@ import androidx.compose.ui.zIndex
 import com.soundcloud.lite.api.TrackInfo
 import com.soundcloud.lite.ui.MainViewModel
 import com.soundcloud.lite.ui.components.TrackRow
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -72,35 +71,36 @@ fun QueueScreen(
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
 
-    // Local mutable copy — updated optimistically during drag
     val localQueue = remember { mutableStateListOf<TrackInfo>() }
     var localCurId by remember { mutableLongStateOf(-1L) }
-
-    // Drag state
     var draggingId by remember { mutableStateOf<Long?>(null) }
     var dragOffsetY by remember { mutableFloatStateOf(0f) }
 
-    // Bounds of the LazyColumn in root coordinates
+    // Shared scroll speed — written by drag handler, read by scroll coroutine.
+    // Using a plain Float ref (not State) so writes don't trigger recomposition.
+    val scrollSpeedRef = remember { mutableFloatStateOf(0f) }
+
     var listTopY by remember { mutableFloatStateOf(0f) }
     var listBottomY by remember { mutableFloatStateOf(0f) }
 
-    // Auto-scroll job
-    var scrollJob by remember { mutableStateOf<Job?>(null) }
+    // Single long-lived scroll coroutine started once drag begins.
+    // It reads scrollSpeedRef every 16 ms — so speed updates instantly.
+    LaunchedEffect(Unit) {
+        while (true) {
+            val spd = scrollSpeedRef.floatValue
+            if (abs(spd) > 0.1f) listState.scrollBy(spd)
+            delay(16L)
+        }
+    }
 
-    // Sync from player state only when not dragging
+    // Sync from player state when not dragging
     LaunchedEffect(playerQueue, playerCurIdx) {
         if (draggingId == null) {
-            // Deduplicate by id — prevents LazyColumn duplicate-key crash if
-            // two tracks somehow ended up with the same Long id
+            val seen = mutableSetOf<Long>()
             val deduped = playerQueue.mapIndexed { idx, t ->
-                t
-            }.let { list ->
-                val seen = mutableSetOf<Long>()
-                list.mapIndexed { idx, t ->
-                    var id = t.id
-                    while (!seen.add(id)) id = id xor ((idx + 1L) * -7046029254386353131L)
-                    if (id == t.id) t else t.copy(id = id)
-                }
+                var id = t.id
+                while (!seen.add(id)) id = id xor ((idx + 1L) * -7046029254386353131L)
+                if (id == t.id) t else t.copy(id = id)
             }
             localQueue.clear()
             localQueue.addAll(deduped)
@@ -109,7 +109,7 @@ fun QueueScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // ── Header ──────────────────────────────────────────────────────────
+        // ── Header ────────────────────────────────────────────────────────────
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -144,9 +144,11 @@ fun QueueScreen(
             return@Column
         }
 
-        val rowHeightDp = 68.dp
-        val rowHeightPx = with(density) { rowHeightDp.toPx() }
-        val edgeZonePx = with(density) { 100.dp.toPx() }
+        val rowHeightPx = with(density) { 70.dp.toPx() }
+        // Edge zone: how many px from top/bottom triggers auto-scroll
+        val edgeZonePx = with(density) { 120.dp.toPx() }
+        // Max scroll speed in px/frame
+        val maxScrollSpeed = 40f
 
         LazyColumn(
             state = listState,
@@ -164,13 +166,11 @@ fun QueueScreen(
                 val isCurrent = track.id == localCurId
                 val isThisDragging = track.id == draggingId
 
-                // Swipe-to-dismiss — only when NOT dragging this row
                 val dismissState = rememberSwipeToDismissBoxState(
                     positionalThreshold = { total -> total * 0.40f },
                 )
                 LaunchedEffect(dismissState.currentValue) {
                     if (dismissState.currentValue != SwipeToDismissBoxValue.Settled) {
-                        // Dismiss action
                         if (isCurrent) {
                             viewModel.playerManager.stopAndRemoveCurrent()
                         } else {
@@ -184,10 +184,8 @@ fun QueueScreen(
                 }
 
                 SwipeToDismissBox(
-                    state = if (isThisDragging) {
-                        // Disable swipe on the row being dragged to avoid conflicts
-                        rememberSwipeToDismissBoxState()
-                    } else dismissState,
+                    // Block swipe while dragging this row
+                    state = if (isThisDragging) rememberSwipeToDismissBoxState() else dismissState,
                     modifier = if (isThisDragging)
                         Modifier.zIndex(10f)
                     else
@@ -208,11 +206,9 @@ fun QueueScreen(
                             .background(MaterialTheme.colorScheme.surface)
                             .then(
                                 if (isThisDragging)
-                                    Modifier.offset { IntOffset(0, dragOffsetY.roundToInt()) }
-                                        .graphicsLayer {
-                                            shadowElevation = 20f
-                                            scaleX = 1.03f; scaleY = 1.03f
-                                        }
+                                    Modifier
+                                        .offset { IntOffset(0, dragOffsetY.roundToInt()) }
+                                        .graphicsLayer { shadowElevation = 20f; scaleX = 1.03f; scaleY = 1.03f }
                                 else Modifier
                             ),
                         verticalAlignment = Alignment.CenterVertically,
@@ -223,7 +219,7 @@ fun QueueScreen(
                             onClick = { viewModel.playerManager.play(track, localQueue.toList()) },
                         )
 
-                        // ── Drag handle ──────────────────────────────────────
+                        // Drag handle — immediate drag (no long press)
                         var handleRootY by remember { mutableFloatStateOf(0f) }
                         Icon(
                             imageVector = Icons.Filled.DragHandle,
@@ -246,57 +242,41 @@ fun QueueScreen(
                                             dragOffsetY += drag.y
                                             handleRootY += drag.y
 
-                                            // ── Reorder logic ──────────────
+                                            // ── Reorder ───────────────────────
                                             val from = localQueue.indexOfFirst { it.id == draggingId }
                                             if (from >= 0) {
                                                 val steps = (dragOffsetY / rowHeightPx).toInt()
                                                 if (steps != 0) {
                                                     val to = (from + steps).coerceIn(0, localQueue.size - 1)
                                                     if (to != from) {
-                                                        val item = localQueue.removeAt(from)
-                                                        localQueue.add(to, item)
+                                                        localQueue.add(to, localQueue.removeAt(from))
                                                         dragOffsetY -= steps * rowHeightPx
                                                     }
                                                 }
                                             }
 
-                                            // ── Edge auto-scroll (coroutine) ──
-                                            val relToTop = handleRootY - listTopY
-                                            val relToBottom = listBottomY - handleRootY
-
-                                            val targetSpeed: Float = when {
-                                                relToTop < edgeZonePx && relToTop >= 0f ->
-                                                    // Upper edge — scroll up
-                                                    -((1f - relToTop / edgeZonePx) * 25f)
-                                                relToBottom < edgeZonePx && relToBottom >= 0f ->
-                                                    // Lower edge — scroll down
-                                                    (1f - relToBottom / edgeZonePx) * 25f
+                                            // ── Update scroll speed (read by coroutine) ──
+                                            val relTop = handleRootY - listTopY
+                                            val relBottom = listBottomY - handleRootY
+                                            scrollSpeedRef.floatValue = when {
+                                                relTop in 0f..edgeZonePx ->
+                                                    // Upper edge: faster closer to top
+                                                    -((1f - relTop / edgeZonePx) * maxScrollSpeed)
+                                                relBottom in 0f..edgeZonePx ->
+                                                    // Lower edge: faster closer to bottom
+                                                    (1f - relBottom / edgeZonePx) * maxScrollSpeed
                                                 else -> 0f
-                                            }
-
-                                            if (abs(targetSpeed) > 0.5f) {
-                                                if (scrollJob == null || scrollJob?.isActive == false) {
-                                                    scrollJob = scope.launch {
-                                                        while (isActive) {
-                                                            listState.scrollBy(targetSpeed)
-                                                            delay(16L) // ~60 fps
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                scrollJob?.cancel()
-                                                scrollJob = null
                                             }
                                         },
                                         onDragEnd = {
-                                            scrollJob?.cancel(); scrollJob = null
+                                            scrollSpeedRef.floatValue = 0f
                                             val newCurIdx = localQueue.indexOfFirst { it.id == localCurId }.coerceAtLeast(0)
                                             viewModel.playerManager.setQueue(localQueue.toList(), newCurIdx)
                                             draggingId = null
                                             dragOffsetY = 0f
                                         },
                                         onDragCancel = {
-                                            scrollJob?.cancel(); scrollJob = null
+                                            scrollSpeedRef.floatValue = 0f
                                             draggingId = null
                                             dragOffsetY = 0f
                                         },

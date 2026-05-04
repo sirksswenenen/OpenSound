@@ -27,7 +27,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -327,106 +329,85 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * For each unplayable placeholder track, find a matching playable track.
-     *
-     * Priority: Audius (fast, no proxy) → YouTube/Invidious (fallback).
-     * Matching: prefer exact title+artist, penalise remix/cover/live/karaoke
-     * unless the original title also contains those words.
-     * Processed in batches of 8 on IO dispatcher.
+     * Resolves all unplayable placeholders to actual tracks in parallel.
+     * All coroutines are launched at once; a Semaphore caps simultaneous
+     * API calls at 20 so we don't overwhelm Audius/Invidious.
+     * A per-track timeout of 12 s prevents one slow call from blocking everything.
      */
     private suspend fun resolveImportedTracks(tracks: List<TrackInfo>): List<TrackInfo> = coroutineScope {
-        tracks.chunked(8).map { chunk ->
-            chunk.map { t ->
-                async(Dispatchers.IO) {
-                    if (!t.isUnplayable) return@async t
-                    if (t.title.isBlank()) return@async t
-
-                    val expectedMs = t.duration.takeIf { it > 5_000L }
-                    val titleLower = t.title.lowercase()
-                    val artistLower = t.artistName.lowercase()
-
-                    // Build search queries: precise first, title-only fallback
-                    val queries = buildList {
-                        if (t.artistName.isNotBlank()) add("${t.artistName} ${t.title}")
-                        add(t.title)
-                    }.distinct()
-
-                    // Tags that indicate a non-original version (only penalised if
-                    // the ORIGINAL title doesn't contain them)
-                    val badTags = listOf("remix", "cover", "karaoke", "live", "acoustic",
-                        "instrumental", "tribute", "mashup", "bootleg")
-                    val originalHasTags = badTags.filter { titleLower.contains(it) }.toSet()
-
-                    fun score(c: TrackInfo): Int {
-                        var s = 0
-                        val ct = c.title.lowercase()
-                        val ca = c.artistName.lowercase()
-                        // Title similarity
-                        if (ct.contains(titleLower) || titleLower.contains(ct)) s += 30
-                        // Artist match
-                        if (artistLower.isNotBlank() && (ca.contains(artistLower) || artistLower.contains(ca))) s += 20
-                        // Penalise unwanted tags not in original
-                        for (tag in badTags) {
-                            if (ct.contains(tag) && tag !in originalHasTags) s -= 25
-                        }
-                        // Duration proximity bonus (if known)
-                        if (expectedMs != null && c.duration > 0L) {
-                            val diff = kotlin.math.abs(c.duration - expectedMs)
-                            val pct = diff.toDouble() / expectedMs
-                            s += when {
-                                pct < 0.05 -> 20
-                                pct < 0.15 -> 10
-                                pct < 0.30 -> 5
-                                pct < 0.50 -> 0
-                                else -> -15
-                            }
-                        }
-                        return s
-                    }
-
-                    fun bestMatch(candidates: List<TrackInfo>): TrackInfo? {
-                        if (candidates.isEmpty()) return null
-                        val scored = candidates.map { it to score(it) }
-                        val best = scored.maxByOrNull { it.second }
-                        // Reject if score is deeply negative (very wrong track)
-                        return if ((best?.second ?: -999) > -20) best?.first else null
-                    }
-
-                    var playable: TrackInfo? = null
-
-                    for (query in queries) {
-                        if (playable != null) break
-
-                        // 1. Audius
-                        val audiusCandidates = runCatching {
-                            audiusApi.search(query, limit = 10).tracks
-                        }.getOrDefault(emptyList())
-                        playable = bestMatch(audiusCandidates)
-
-                        // 2. YouTube/Invidious
-                        if (playable == null) {
-                            val ytCandidates = runCatching {
-                                youTubeApi.search(query, limit = 10)
-                            }.getOrDefault(emptyList())
-                            playable = bestMatch(ytCandidates)
-                        }
-                    }
-
-                    if (playable != null) {
-                        playable.copy(
-                            title = t.title.ifBlank { playable.title },
-                            artistName = t.artistName.ifBlank { playable.artistName },
-                            // Use provider's artwork URL (public CDN, no auth)
-                            artworkUrl = playable.artworkUrl ?: t.artworkUrl,
-                            duration = if (expectedMs != null && expectedMs > 0) expectedMs else playable.duration,
-                            isUnplayable = false,
-                        )
-                    } else {
-                        t
-                    }
+        val sem = kotlinx.coroutines.sync.Semaphore(20)
+        tracks.map { t ->
+            async(Dispatchers.IO) {
+                if (!t.isUnplayable) return@async t
+                if (t.title.isBlank()) return@async t
+                sem.withPermit {
+                    kotlinx.coroutines.withTimeoutOrNull(12_000L) {
+                        resolveOneTrack(t)
+                    } ?: t
                 }
-            }.awaitAll()
-        }.flatten()
+            }
+        }.awaitAll()
+    }
+
+    private suspend fun resolveOneTrack(t: TrackInfo): TrackInfo {
+        val expectedMs = t.duration.takeIf { it > 5_000L }
+        val titleLower = t.title.lowercase()
+        val artistLower = t.artistName.lowercase()
+        val badTags = listOf("remix", "cover", "karaoke", "live", "acoustic",
+            "instrumental", "tribute", "mashup", "bootleg")
+        val originalHasTags = badTags.filter { titleLower.contains(it) }.toSet()
+
+        fun score(c: TrackInfo): Int {
+            var s = 0
+            val ct = c.title.lowercase()
+            val ca = c.artistName.lowercase()
+            if (ct.contains(titleLower) || titleLower.contains(ct)) s += 30
+            if (artistLower.isNotBlank() &&
+                (ca.contains(artistLower) || artistLower.contains(ca))) s += 20
+            for (tag in badTags) if (ct.contains(tag) && tag !in originalHasTags) s -= 25
+            if (expectedMs != null && c.duration > 0L) {
+                val pct = kotlin.math.abs(c.duration - expectedMs).toDouble() / expectedMs
+                s += when { pct < 0.05 -> 20; pct < 0.15 -> 10; pct < 0.30 -> 5; pct < 0.50 -> 0; else -> -15 }
+            }
+            return s
+        }
+
+        fun bestMatch(candidates: List<TrackInfo>): TrackInfo? {
+            if (candidates.isEmpty()) return null
+            val best = candidates.maxByOrNull { score(it) } ?: return null
+            return if (score(best) > -20) best else null
+        }
+
+        val queries = buildList {
+            if (t.artistName.isNotBlank()) add("${t.artistName} ${t.title}")
+            add(t.title)
+        }.distinct()
+
+        for (query in queries) {
+            // 1. Audius — fast, no proxy
+            val audius = runCatching { audiusApi.search(query, limit = 8).tracks }.getOrDefault(emptyList())
+            bestMatch(audius)?.let { found ->
+                return found.copy(
+                    title = t.title.ifBlank { found.title },
+                    artistName = t.artistName.ifBlank { found.artistName },
+                    artworkUrl = found.artworkUrl ?: t.artworkUrl,
+                    duration = if (expectedMs != null && expectedMs > 0) expectedMs else found.duration,
+                    isUnplayable = false,
+                )
+            }
+            // 2. YouTube/Invidious — fallback
+            val yt = runCatching { youTubeApi.search(query, limit = 8) }.getOrDefault(emptyList())
+            bestMatch(yt)?.let { found ->
+                return found.copy(
+                    title = t.title.ifBlank { found.title },
+                    artistName = t.artistName.ifBlank { found.artistName },
+                    artworkUrl = found.artworkUrl ?: t.artworkUrl,
+                    duration = if (expectedMs != null && expectedMs > 0) expectedMs else found.duration,
+                    isUnplayable = false,
+                )
+            }
+        }
+        return t
     }
     // ---- Downloads ----
 
