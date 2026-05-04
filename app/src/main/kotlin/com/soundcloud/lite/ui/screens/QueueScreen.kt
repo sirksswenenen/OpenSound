@@ -98,7 +98,7 @@ fun QueueScreen(
                 val seen = mutableSetOf<Long>()
                 list.mapIndexed { idx, t ->
                     var id = t.id
-                    while (!seen.add(id)) id = id xor ((idx + 1L) * 0x9e3779b97f4a7c15L)
+                    while (!seen.add(id)) id = id xor ((idx + 1L) * -7046029254386353131L)
                     if (id == t.id) t else t.copy(id = id)
                 }
             }
