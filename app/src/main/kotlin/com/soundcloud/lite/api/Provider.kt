@@ -8,5 +8,6 @@ package com.soundcloud.lite.api
 enum class Provider(val display: String) {
     AUDIUS("Audius"),
     YOUTUBE("YouTube"),
+    SOUNDCLOUD("SoundCloud"),
     UNKNOWN("Unknown"),
 }

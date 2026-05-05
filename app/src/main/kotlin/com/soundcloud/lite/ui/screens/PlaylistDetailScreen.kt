@@ -70,10 +70,32 @@ fun PlaylistDetailScreen(
                 )
             }
             if (playlist.tracks.isNotEmpty()) {
+                // Play all
                 IconButton(onClick = {
                     viewModel.playerManager.play(playlist.tracks.first(), playlist.tracks)
                 }) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = "Play")
+                }
+                // Batch download — downloads all un-downloaded playable tracks
+                val anyNotDownloaded = playlist.tracks.any {
+                    !it.isUnplayable && !downloads.any { d -> d.track.id == it.id && d.status == com.soundcloud.lite.data.DownloadStatus.DONE }
+                }
+                val batchDownloading = downloads.any { it.status == com.soundcloud.lite.data.DownloadStatus.DOWNLOADING }
+                if (batchDownloading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.padding(horizontal = 8.dp).size(24.dp),
+                        strokeWidth = 2.dp,
+                    )
+                } else if (anyNotDownloaded) {
+                    IconButton(onClick = { viewModel.downloadPlaylist(playlist.id) }) {
+                        Icon(Icons.Filled.Download, contentDescription = "Download all",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                } else {
+                    // All downloaded
+                    Icon(Icons.Filled.DownloadDone, contentDescription = "All downloaded",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(horizontal = 12.dp))
                 }
             }
         }

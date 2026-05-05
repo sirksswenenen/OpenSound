@@ -130,7 +130,7 @@ class PlaylistImporter(
                 tracks += TrackInfo(
                     id = scIdToLong("$id"),
                     providerId = id,
-                    provider = Provider.UNKNOWN,
+                    provider = Provider.SOUNDCLOUD,
                     title = "Track $id",
                     isUnplayable = true,
                 )
@@ -193,7 +193,7 @@ class PlaylistImporter(
             fullTracks += TrackInfo(
                 id = scIdToLong("$scId"),
                 providerId = scId,
-                provider = Provider.UNKNOWN,
+                provider = Provider.SOUNDCLOUD,
                 title = trackTitle,
                 artistName = artist,
                 artworkUrl = artwork,
@@ -278,7 +278,7 @@ class PlaylistImporter(
                 result += TrackInfo(
                     id = scIdToLong("$scId"),
                     providerId = scId,
-                    provider = Provider.UNKNOWN,
+                    provider = Provider.SOUNDCLOUD,
                     title = trackTitle,
                     artistName = artist,
                     artworkUrl = artwork,
@@ -309,7 +309,7 @@ class PlaylistImporter(
             tracks += TrackInfo(
                 id = numericId,
                 providerId = scId ?: "",
-                provider = Provider.UNKNOWN,
+                provider = Provider.SOUNDCLOUD,
                 title = title,
                 artistName = artistName,
                 duration = durationMs,

@@ -36,6 +36,7 @@ class PlayerManager(
     private val context: Context,
     private val audius: AudiusApi,
     private val youtube: YouTubeApi,
+    private val soundCloud: com.soundcloud.lite.api.SoundCloudApi,
 ) {
 
     fun resolveStreamUrlPublic(track: TrackInfo): String? = resolveStreamUrl(track)
@@ -49,6 +50,8 @@ class PlayerManager(
         return when (track.provider) {
             Provider.AUDIUS -> if (track.providerId.isNotBlank()) audius.streamUrl(track.providerId) else null
             Provider.YOUTUBE -> if (track.providerId.isNotBlank()) youtube.streamUrl(track.providerId) else null
+            Provider.SOUNDCLOUD -> if (track.providerId.isNotBlank())
+                soundCloud.getStreamUrl(track.providerId)?.url else null
             Provider.UNKNOWN -> null
         }
     }

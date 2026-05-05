@@ -7,6 +7,7 @@ import com.soundcloud.lite.api.AlternativeSource
 import com.soundcloud.lite.api.AudiusApi
 import com.soundcloud.lite.api.PlaylistImporter
 import com.soundcloud.lite.api.Provider
+import com.soundcloud.lite.api.SoundCloudApi
 import com.soundcloud.lite.api.TrackInfo
 import com.soundcloud.lite.api.YouTubeApi
 import com.soundcloud.lite.api.iTunesApi
@@ -42,9 +43,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val audiusApi: AudiusApi = AudiusApi()
     val youTubeApi: YouTubeApi = YouTubeApi()
+    val soundCloudApi: SoundCloudApi = SoundCloudApi()
     val iTunes: iTunesApi = iTunesApi()
     val playlistImporter: PlaylistImporter = PlaylistImporter(youTubeApi)
-    val playerManager: PlayerManager = PlayerManager(application, audiusApi, youTubeApi)
+    val playerManager: PlayerManager = PlayerManager(application, audiusApi, youTubeApi, soundCloudApi)
 
     /** Long id → opaque providerId. Lets screens keep using Long
      *  identifiers in NavHost arguments. Populated lazily as we
@@ -86,6 +88,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         // Give the player access to local downloads so it uses file:// URLs
         playerManager.downloadRepo = downloadRepo
+        // Keep SoundCloud OAuth token in sync with settings
+        viewModelScope.launch {
+            settings.collect { s -> soundCloudApi.oauthToken = s.soundCloudOAuthToken }
+        }
     }
 
     private val _altSourceState = MutableStateFlow<AltSourceState?>(null)
@@ -178,7 +184,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ---- Trending ----
 
     fun loadTrending() {
-        if (_trending.value.isNotEmpty()) return
+        // Always refresh — SC trending is not paginated
+        if (_trending.value.isNotEmpty() && nextTrendingOffset == null) return
+        nextTrendingOffset = 0
         loadMoreTrending()
     }
 
@@ -188,10 +196,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _isLoadingTrending.value = true
             try {
-                val page = withContext(Dispatchers.IO) { audiusApi.getTrending(offset = off) }
-                rememberProviderIds(page.tracks)
-                _trending.update { it + page.tracks }
-                nextTrendingOffset = page.nextOffset
+                val tracks = withContext(Dispatchers.IO) {
+                    // Derive a genre hint from the user's playlists if possible
+                    val genre = _playlists.value
+                        .flatMap { it.tracks }
+                        .mapNotNull { it.genre }
+                        .groupingBy { it }
+                        .eachCount()
+                        .maxByOrNull { it.value }
+                        ?.key
+
+                    val scTracks = runCatching { soundCloudApi.getTrending(genre = genre, limit = 50) }.getOrDefault(emptyList())
+                    if (scTracks.isNotEmpty()) {
+                        scTracks
+                    } else {
+                        // Fall back to Audius if SC trending fails
+                        audiusApi.getTrending(offset = off).tracks
+                    }
+                }
+                rememberProviderIds(tracks)
+                _trending.update { if (off == 0) tracks else it + tracks }
+                // SC trending is one-shot (no paging), Audius has pages
+                nextTrendingOffset = null
             } catch (t: Throwable) {
                 _toast.value = "Trending failed: ${t.message ?: t::class.java.simpleName}"
             } finally {
@@ -289,11 +315,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         _toast.value = "Import failed (${result.sourceName}): ${result.message}"
                     }
                     is PlaylistImporter.ImportResult.Success -> {
-                        val resolvedTracks = withContext(Dispatchers.IO) { resolveImportedTracks(result.tracks) }
-                        // CRITICAL: deduplicate by id — two SC tracks might resolve
-                        // to the same Audius/YouTube track giving them the same Long id,
-                        // which causes LazyColumn "duplicate key" crash.
-                        val deduplicated = deduplicateByLongId(resolvedTracks)
+                        // SC tracks stream directly — no need to resolve against Audius/YouTube.
+                        // Only non-SC unplayable tracks go through the slow resolve step.
+                        val scTracks = result.tracks.filter { it.provider == Provider.SOUNDCLOUD }
+                            .map { it.copy(isUnplayable = false) }
+                        val otherTracks = result.tracks.filter { it.provider != Provider.SOUNDCLOUD }
+                        val resolvedOthers = if (otherTracks.any { it.isUnplayable }) {
+                            withContext(Dispatchers.IO) { resolveImportedTracks(otherTracks) }
+                        } else otherTracks
+
+                        val allTracks = (scTracks + resolvedOthers)
+                            .sortedBy { result.tracks.indexOfFirst { t -> t.id == it.id } }
+                        val deduplicated = deduplicateByLongId(allTracks)
                         rememberProviderIds(deduplicated)
                         val pl = Playlist(
                             id = "import:" + java.util.UUID.randomUUID().toString().take(8),
@@ -303,7 +336,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         )
                         _playlists.update { it + pl }
                         val matched = deduplicated.count { !it.isUnplayable }
-                        _toast.value = "Imported '${result.title}' (${matched}/${deduplicated.size} playable)"
+                        _toast.value = "Imported '${result.title}' ($matched/${deduplicated.size} playable)"
                     }
                 }
             } catch (t: Throwable) {
@@ -411,29 +444,85 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
     // ---- Downloads ----
 
+    /** Download a single track. SC previews (≤31s) are replaced by a YouTube alternative. */
     fun downloadTrack(track: TrackInfo) {
-        if (track.isUnplayable) { _toast.value = "Track has no playable source to download."; return }
+        if (track.isUnplayable) { _toast.value = "Track has no playable source."; return }
         if (downloadRepo.isDownloaded(track.id)) { _toast.value = "Already downloaded."; return }
         viewModelScope.launch {
-            _toast.value = "Starting download: ${track.title}"
-            val streamUrl = withContext(Dispatchers.IO) {
-                when (track.provider) {
-                    com.soundcloud.lite.api.Provider.AUDIUS ->
-                        if (track.providerId.isNotBlank()) playerManager.resolveStreamUrlPublic(track) else null
-                    com.soundcloud.lite.api.Provider.YOUTUBE ->
-                        if (track.providerId.isNotBlank()) playerManager.resolveStreamUrlPublic(track) else null
-                    else -> null
+            _toast.value = "Downloading: ${track.title}"
+            val result = withContext(Dispatchers.IO) { resolveDownloadUrl(track) }
+            when (result) {
+                null -> _toast.value = "Download failed: no stream for ${track.title}"
+                else -> {
+                    val path = downloadRepo.download(result.first, result.second)
+                    if (path != null) _toast.value = "Downloaded: ${track.title}"
+                    else _toast.value = "Download failed: ${track.title}"
                 }
-            }
-            if (streamUrl == null) { _toast.value = "Could not resolve stream for download."; return@launch }
-            val path = downloadRepo.download(track, streamUrl)
-            if (path != null) {
-                _toast.value = "Downloaded: ${track.title}"
-            } else {
-                _toast.value = "Download failed: ${track.title}"
             }
         }
     }
+
+    /** Download all playable tracks in a playlist that aren't already downloaded. */
+    fun downloadPlaylist(playlistId: String) {
+        val pl = _playlists.value.firstOrNull { it.id == playlistId } ?: return
+        val toDownload = pl.tracks.filter { !it.isUnplayable && !downloadRepo.isDownloaded(it.id) }
+        if (toDownload.isEmpty()) { _toast.value = "All tracks already downloaded."; return }
+        _toast.value = "Downloading ${toDownload.size} tracks…"
+        viewModelScope.launch {
+            toDownload.forEach { track ->
+                launch(Dispatchers.IO) {
+                    val result = resolveDownloadUrl(track) ?: return@launch
+                    downloadRepo.download(result.first, result.second)
+                }
+            }
+        }
+    }
+
+    /**
+     * Resolves the best download URL for a track.
+     * For SC tracks: uses SC stream API. If the stream is a preview (≤31 s),
+     * substitutes the best YouTube match instead.
+     * Returns Pair(effectiveTrackInfo, streamUrl) or null on failure.
+     */
+    private suspend fun resolveDownloadUrl(track: TrackInfo): Pair<TrackInfo, String>? {
+        return when (track.provider) {
+            Provider.SOUNDCLOUD -> {
+                val scResult = runCatching {
+                    soundCloudApi.getStreamUrl(track.providerId)
+                }.getOrNull()
+
+                if (scResult == null) return null
+
+                if (scResult.isPreview || track.duration in 1L..31_000L) {
+                    // Preview track — find YouTube alternative
+                    val ytMatch = runCatching {
+                        youTubeApi.search("${track.artistName} ${track.title}", limit = 5)
+                            .firstOrNull { it.duration > 31_000L }
+                    }.getOrNull()
+                    if (ytMatch != null) {
+                        val ytUrl = youtube().streamUrl(ytMatch.providerId)
+                        Pair(track.copy(provider = Provider.YOUTUBE, providerId = ytMatch.providerId), ytUrl)
+                    } else {
+                        // No YT alternative, use preview anyway
+                        Pair(track, scResult.url)
+                    }
+                } else {
+                    Pair(track, scResult.url)
+                }
+            }
+            Provider.AUDIUS -> {
+                val url = playerManager.resolveStreamUrlPublic(track) ?: return null
+                Pair(track, url)
+            }
+            Provider.YOUTUBE -> {
+                val url = playerManager.resolveStreamUrlPublic(track) ?: return null
+                Pair(track, url)
+            }
+            Provider.UNKNOWN -> null
+        }
+    }
+
+    private fun youtube() = youTubeApi
 
     fun removeDownload(trackId: Long) {
         downloadRepo.removeDownload(trackId)
