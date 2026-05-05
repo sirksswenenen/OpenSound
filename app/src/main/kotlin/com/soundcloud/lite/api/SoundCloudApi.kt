@@ -2,6 +2,7 @@ package com.soundcloud.lite.api
 
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.MediaType.Companion.toMediaType
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
@@ -103,17 +104,17 @@ class SoundCloudApi(
     fun getCobaltStreamUrl(scUrl: String, cobaltBase: String = "https://api.cobalt.tools"): String? {
         return try {
             val body = """{"url":"$scUrl","audioFormat":"mp3","isAudioOnly":true,"aFormat":"mp3"}"""
+            val requestBody = body.toByteArray()
+                .let { okhttp3.RequestBody.create("application/json; charset=utf-8".toMediaType(), it) }
             val req = okhttp3.Request.Builder()
                 .url("$cobaltBase/")
-                .post(okhttp3.RequestBody.create(
-                    okhttp3.MediaType.parse("application/json"), body))
+                .post(requestBody)
                 .header("Accept", "application/json")
                 .header("Content-Type", "application/json")
                 .build()
             http.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return null
                 val json = resp.body?.string() ?: return null
-                // Response: {"status":"stream","url":"..."}  or  {"status":"redirect","url":"..."}
                 extractJsonString(json, "\"url\"")
             }
         } catch (_: Exception) { null }
