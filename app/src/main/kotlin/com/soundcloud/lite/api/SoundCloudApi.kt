@@ -19,6 +19,7 @@ class SoundCloudApi(
 ) {
     private val cachedClientId = AtomicReference<String?>(null)
     var oauthToken: String = ""
+    var cobaltBaseUrl: String = "https://api.cobalt.tools"
 
     // ── client_id ────────────────────────────────────────────────────────────
 
@@ -54,35 +55,68 @@ class SoundCloudApi(
     // ── Stream URLs ──────────────────────────────────────────────────────────
 
     /**
-     * Resolves a playable/downloadable stream URL for a SC track ID.
-     * Returns null if the track is not streamable (e.g. region-locked, premium).
+     * Resolves a playable stream URL for a SC track.
      *
-     * Also returns whether the URL is a preview (≤31 s) so callers can
-     * decide to substitute a YouTube version.
+     * Strategy:
+     * 1. SC API-v2 /streams (requires client_id — fast if available)
+     * 2. Cobalt API (cobalt.tools) — works without client_id, handles region locks
+     *
+     * Returns null if all methods fail.
      */
     data class StreamResult(val url: String, val isPreview: Boolean, val durationMs: Long)
 
-    fun getStreamUrl(trackId: String): StreamResult? {
-        val cid = clientId() ?: return null
-        val auth = if (oauthToken.isNotBlank()) "&oauth_token=$oauthToken" else ""
-        val url = "https://api-v2.soundcloud.com/tracks/$trackId/streams?client_id=$cid$auth"
-        val json = httpGetWithAuth(url) ?: run {
-            // Might be expired client_id — retry once
-            invalidateClientId()
-            val cid2 = clientId() ?: return null
-            httpGetWithAuth("https://api-v2.soundcloud.com/tracks/$trackId/streams?client_id=$cid2$auth")
-        } ?: return null
-
-        // Prefer full mp3, fall back to preview
-        val fullUrl = extractJsonString(json, "\"http_mp3_128_url\"")
-            ?: extractJsonString(json, "\"hls_mp3_128_url\"")
-        val previewUrl = extractJsonString(json, "\"preview_mp3_128_url\"")
-
-        return when {
-            fullUrl != null -> StreamResult(fullUrl, false, 0L)
-            previewUrl != null -> StreamResult(previewUrl, true, 0L)
-            else -> null
+    fun getStreamUrl(trackId: String, trackPermalink: String? = null): StreamResult? {
+        // ── Method 1: SC API-v2 with client_id ──────────────────────────────
+        val cid = clientId()
+        if (cid != null) {
+            val auth = if (oauthToken.isNotBlank()) "&oauth_token=$oauthToken" else ""
+            val json = httpGetWithAuth(
+                "https://api-v2.soundcloud.com/tracks/$trackId/streams?client_id=$cid$auth"
+            )
+            if (json != null) {
+                val fullUrl = extractJsonString(json, "\"http_mp3_128_url\"")
+                    ?: extractJsonString(json, "\"hls_mp3_128_url\"")
+                val previewUrl = extractJsonString(json, "\"preview_mp3_128_url\"")
+                when {
+                    fullUrl != null    -> return StreamResult(fullUrl, false, 0L)
+                    previewUrl != null -> return StreamResult(previewUrl, true, 0L)
+                }
+            }
         }
+
+        // ── Method 2: Cobalt API ─────────────────────────────────────────────
+        if (trackPermalink != null || trackId.isNotBlank()) {
+            val scUrl = if (trackPermalink != null)
+                trackPermalink
+            else
+                "https://soundcloud.com/tracks/$trackId"
+            val cobaltUrl = getCobaltStreamUrl(scUrl, cobaltBaseUrl)
+            if (cobaltUrl != null) return StreamResult(cobaltUrl, false, 0L)
+        }
+
+        return null
+    }
+
+    /**
+     * Calls api.cobalt.tools to get a direct stream URL for a SoundCloud URL.
+     */
+    fun getCobaltStreamUrl(scUrl: String, cobaltBase: String = "https://api.cobalt.tools"): String? {
+        return try {
+            val body = """{"url":"$scUrl","audioFormat":"mp3","isAudioOnly":true,"aFormat":"mp3"}"""
+            val req = okhttp3.Request.Builder()
+                .url("$cobaltBase/")
+                .post(okhttp3.RequestBody.create(
+                    okhttp3.MediaType.parse("application/json"), body))
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .build()
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                val json = resp.body?.string() ?: return null
+                // Response: {"status":"stream","url":"..."}  or  {"status":"redirect","url":"..."}
+                extractJsonString(json, "\"url\"")
+            }
+        } catch (_: Exception) { null }
     }
 
     // ── Track metadata ───────────────────────────────────────────────────────

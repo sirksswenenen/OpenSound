@@ -51,10 +51,8 @@ import com.soundcloud.lite.api.TrackInfo
 import com.soundcloud.lite.ui.MainViewModel
 import com.soundcloud.lite.ui.components.TrackRow
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.abs
-import kotlin.math.roundToInt
 
 @Composable
 fun QueueScreen(
@@ -71,27 +69,29 @@ fun QueueScreen(
 
     val localQueue = remember { mutableStateListOf<TrackInfo>() }
     var localCurId by remember { mutableLongStateOf(-1L) }
-    var draggingId by remember { mutableStateOf<Long?>(null) }
 
-    // Visual offset for the dragged row in px, relative to its resting position
+    // draggingId triggers recomposition (needed to show/hide visual).
+    var draggingId by remember { mutableStateOf<Long?>(null) }
+    // dragVisualOffsetY triggers recomposition (needed to move the row visually).
     var dragVisualOffsetY by remember { mutableFloatStateOf(0f) }
 
-    // Absolute Y of the pointer in root coords — updated every drag event
-    val pointerRootY = remember { mutableFloatStateOf(0f) }
+    // These are plain FloatArrays — written on every drag event but never
+    // trigger recomposition, so gesture handlers never restart mid-drag.
+    val pointerRootYRef = remember { FloatArray(1) { 0f } }
+    val listTopYRef   = remember { FloatArray(1) { 0f } }
+    val listBottomYRef = remember { FloatArray(1) { 0f } }
 
-    // List bounds in root coords
-    var listTopY by remember { mutableFloatStateOf(0f) }
-    var listBottomY by remember { mutableFloatStateOf(0f) }
-
-    // Continuous scroll loop — reads pointerRootY every frame
+    // Single continuous scroll coroutine — reads plain floats every 16 ms.
     LaunchedEffect(Unit) {
         while (true) {
             if (draggingId != null) {
-                val py = pointerRootY.floatValue
-                val relTop = py - listTopY
-                val relBot = listBottomY - py
-                val edgeZone = with(density) { 140.dp.toPx() }
-                val maxSpeed = 50f
+                val py  = pointerRootYRef[0]
+                val top = listTopYRef[0]
+                val bot = listBottomYRef[0]
+                val edgeZone = with(density) { 150.dp.toPx() }
+                val maxSpeed = 55f
+                val relTop = py - top
+                val relBot = bot - py
                 val speed = when {
                     relTop in 0f..edgeZone -> -((1f - relTop / edgeZone) * maxSpeed)
                     relBot in 0f..edgeZone ->  (1f - relBot / edgeZone) * maxSpeed
@@ -119,6 +119,7 @@ fun QueueScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
+        // Header
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -158,14 +159,15 @@ fun QueueScreen(
                 .fillMaxSize()
                 .padding(horizontal = 12.dp)
                 .onGloballyPositioned { coords ->
-                    listTopY = coords.positionInRoot().y
-                    listBottomY = listTopY + coords.size.height
+                    // Plain float write — no recomposition
+                    listTopYRef[0]    = coords.positionInRoot().y
+                    listBottomYRef[0] = listTopYRef[0] + coords.size.height
                 },
             contentPadding = PaddingValues(bottom = 96.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
             itemsIndexed(localQueue, key = { _, t -> t.id }) { index, track ->
-                val isCurrent = track.id == localCurId
+                val isCurrent     = track.id == localCurId
                 val isThisDragging = track.id == draggingId
 
                 val dismissState = rememberSwipeToDismissBoxState(
@@ -176,10 +178,10 @@ fun QueueScreen(
                         if (isCurrent) {
                             viewModel.playerManager.stopAndRemoveCurrent()
                         } else {
-                            val newQueue = localQueue.toMutableList().also { it.removeAt(index) }
-                            val newCurIdx = newQueue.indexOfFirst { it.id == localCurId }.coerceAtLeast(0)
-                            localQueue.clear(); localQueue.addAll(newQueue)
-                            viewModel.playerManager.setQueue(newQueue, newCurIdx)
+                            val nq = localQueue.toMutableList().also { it.removeAt(index) }
+                            val ni = nq.indexOfFirst { it.id == localCurId }.coerceAtLeast(0)
+                            localQueue.clear(); localQueue.addAll(nq)
+                            viewModel.playerManager.setQueue(nq, ni)
                         }
                         dismissState.reset()
                     }
@@ -208,10 +210,9 @@ fun QueueScreen(
                             .then(
                                 if (isThisDragging)
                                     Modifier.graphicsLayer {
-                                        translationY = dragVisualOffsetY
+                                        translationY   = dragVisualOffsetY
                                         shadowElevation = 24f
-                                        scaleX = 1.03f
-                                        scaleY = 1.03f
+                                        scaleX = 1.03f; scaleY = 1.03f
                                     }
                                 else Modifier
                             ),
@@ -223,33 +224,37 @@ fun QueueScreen(
                             onClick = { viewModel.playerManager.play(track, localQueue.toList()) },
                         )
 
-                        // Drag handle
-                        var handleInitRootY by remember { mutableFloatStateOf(0f) }
+                        // Drag handle — immediate drag, no long press
+                        // handleRootY is a plain FloatArray so writes don't cause recomposition.
+                        val handleRootYRef = remember { FloatArray(1) { 0f } }
                         Icon(
-                            imageVector = Icons.Filled.DragHandle,
+                            imageVector   = Icons.Filled.DragHandle,
                             contentDescription = "Drag to reorder",
                             tint = if (isCurrent) MaterialTheme.colorScheme.primary
                                    else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier
                                 .padding(horizontal = 14.dp)
                                 .onGloballyPositioned { coords ->
-                                    if (draggingId == null)
-                                        handleInitRootY = coords.positionInRoot().y + coords.size.height / 2f
+                                    // Always update — even during another item's drag,
+                                    // so we have fresh position when THIS item starts dragging.
+                                    handleRootYRef[0] =
+                                        coords.positionInRoot().y + coords.size.height / 2f
                                 }
                                 .pointerInput(track.id) {
                                     detectDragGestures(
-                                        onDragStart = { offset ->
-                                            draggingId = track.id
+                                        onDragStart = { localOffset ->
+                                            draggingId        = track.id
                                             dragVisualOffsetY = 0f
-                                            // Snapshot the starting pointer position
-                                            pointerRootY.floatValue = handleInitRootY + offset.y
+                                            // Initialise pointer position from the handle's
+                                            // current root Y (no recomposition-based stale value).
+                                            pointerRootYRef[0] = handleRootYRef[0] + localOffset.y
                                         },
                                         onDrag = { change, drag ->
                                             change.consume()
-                                            dragVisualOffsetY += drag.y
-                                            pointerRootY.floatValue += drag.y
+                                            dragVisualOffsetY   += drag.y
+                                            pointerRootYRef[0]  += drag.y
 
-                                            // Reorder when visual offset exceeds half a row height
+                                            // Reorder when visual displacement exceeds one row
                                             val from = localQueue.indexOfFirst { it.id == draggingId }
                                             if (from >= 0) {
                                                 val steps = (dragVisualOffsetY / rowHeightPx).toInt()
@@ -257,21 +262,20 @@ fun QueueScreen(
                                                     val to = (from + steps).coerceIn(0, localQueue.size - 1)
                                                     if (to != from) {
                                                         localQueue.add(to, localQueue.removeAt(from))
-                                                        // Subtract the distance we just moved so visual
-                                                        // offset resets relative to new position
                                                         dragVisualOffsetY -= steps * rowHeightPx
                                                     }
                                                 }
                                             }
                                         },
                                         onDragEnd = {
-                                            val newCurIdx = localQueue.indexOfFirst { it.id == localCurId }.coerceAtLeast(0)
-                                            viewModel.playerManager.setQueue(localQueue.toList(), newCurIdx)
-                                            draggingId = null
+                                            val ni = localQueue.indexOfFirst { it.id == localCurId }
+                                                .coerceAtLeast(0)
+                                            viewModel.playerManager.setQueue(localQueue.toList(), ni)
+                                            draggingId        = null
                                             dragVisualOffsetY = 0f
                                         },
                                         onDragCancel = {
-                                            draggingId = null
+                                            draggingId        = null
                                             dragVisualOffsetY = 0f
                                         },
                                     )

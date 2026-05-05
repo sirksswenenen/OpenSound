@@ -47,6 +47,7 @@ fun TrackRow(
             .alpha(rowAlpha),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // Artwork
         Box(
             modifier = Modifier
                 .size(44.dp)
@@ -70,21 +71,19 @@ fun TrackRow(
             }
         }
         Spacer(Modifier.width(10.dp))
-        Column(modifier = Modifier.padding(end = 4.dp).weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = track.title,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false),
-                )
-                ProviderBadge(track.provider)
-            }
+
+        // Title + artist (takes all available space)
+        Column(modifier = Modifier.weight(1f).padding(end = 6.dp)) {
             Text(
-                text = if (track.isUnplayable) "${track.artistName} · no playable source"
+                text = track.title,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = if (track.isUnplayable) "${track.artistName} · no source"
                        else track.artistName,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp,
@@ -92,8 +91,12 @@ fun TrackRow(
                 overflow = TextOverflow.Ellipsis,
             )
         }
+
+        // Provider badge — always pinned to the right
+        ProviderBadge(track.provider)
+
         if (trailing != null) {
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(6.dp))
             trailing()
         }
     }
@@ -101,15 +104,15 @@ fun TrackRow(
 
 @Composable
 private fun ProviderBadge(provider: Provider) {
-    val (text, bg, fg) = when (provider) {
-        Provider.AUDIUS -> Triple("AUDIUS", Color(0xFF7138B7), Color.White)
-        Provider.YOUTUBE -> Triple("YT", Color(0xFFCC2222), Color.White)
-        Provider.SOUNDCLOUD -> Triple("SC", Color(0xFFFF5500), Color.White)
-        Provider.UNKNOWN -> return
+    val (text, bg) = when (provider) {
+        Provider.AUDIUS     -> "AUDIUS" to Color(0xFF7138B7)
+        Provider.YOUTUBE    -> "YT"     to Color(0xFFCC2222)
+        Provider.SOUNDCLOUD -> "SC"     to Color(0xFFFF5500)
+        Provider.UNKNOWN    -> return
     }
     Text(
         text = text,
-        color = fg,
+        color = Color.White,
         fontSize = 9.sp,
         fontWeight = FontWeight.Bold,
         modifier = Modifier

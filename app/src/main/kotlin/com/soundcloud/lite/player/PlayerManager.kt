@@ -51,7 +51,10 @@ class PlayerManager(
             Provider.AUDIUS -> if (track.providerId.isNotBlank()) audius.streamUrl(track.providerId) else null
             Provider.YOUTUBE -> if (track.providerId.isNotBlank()) youtube.streamUrl(track.providerId) else null
             Provider.SOUNDCLOUD -> if (track.providerId.isNotBlank())
-                soundCloud.getStreamUrl(track.providerId)?.url else null
+                soundCloud.getStreamUrl(
+                    trackId = track.providerId,
+                    trackPermalink = track.permalink,
+                )?.url else null
             Provider.UNKNOWN -> null
         }
     }

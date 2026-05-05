@@ -88,9 +88,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         // Give the player access to local downloads so it uses file:// URLs
         playerManager.downloadRepo = downloadRepo
-        // Keep SoundCloud OAuth token in sync with settings
+        // Keep SoundCloud OAuth token + cobalt URL in sync with settings
         viewModelScope.launch {
-            settings.collect { s -> soundCloudApi.oauthToken = s.soundCloudOAuthToken }
+            settings.collect { s ->
+                soundCloudApi.oauthToken = s.soundCloudOAuthToken
+                soundCloudApi.cobaltBaseUrl = s.cobaltUrl
+            }
         }
     }
 
@@ -206,13 +209,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         .maxByOrNull { it.value }
                         ?.key
 
-                    val scTracks = runCatching { soundCloudApi.getTrending(genre = genre, limit = 50) }.getOrDefault(emptyList())
-                    if (scTracks.isNotEmpty()) {
-                        scTracks
-                    } else {
-                        // Fall back to Audius if SC trending fails
-                        audiusApi.getTrending(offset = off).tracks
-                    }
+                    runCatching { soundCloudApi.getTrending(genre = genre, limit = 50) }.getOrDefault(emptyList())
                 }
                 rememberProviderIds(tracks)
                 _trending.update { if (off == 0) tracks else it + tracks }
@@ -488,22 +485,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return when (track.provider) {
             Provider.SOUNDCLOUD -> {
                 val scResult = runCatching {
-                    soundCloudApi.getStreamUrl(track.providerId)
+                    soundCloudApi.getStreamUrl(
+                        trackId = track.providerId,
+                        trackPermalink = track.permalink,
+                    )
                 }.getOrNull()
 
                 if (scResult == null) return null
 
                 if (scResult.isPreview || track.duration in 1L..31_000L) {
-                    // Preview track — find YouTube alternative
+                    // Preview — find YouTube alternative
                     val ytMatch = runCatching {
                         youTubeApi.search("${track.artistName} ${track.title}", limit = 5)
                             .firstOrNull { it.duration > 31_000L }
                     }.getOrNull()
                     if (ytMatch != null) {
-                        val ytUrl = youtube().streamUrl(ytMatch.providerId)
+                        val ytUrl = youTubeApi.streamUrl(ytMatch.providerId)
                         Pair(track.copy(provider = Provider.YOUTUBE, providerId = ytMatch.providerId), ytUrl)
                     } else {
-                        // No YT alternative, use preview anyway
                         Pair(track, scResult.url)
                     }
                 } else {
