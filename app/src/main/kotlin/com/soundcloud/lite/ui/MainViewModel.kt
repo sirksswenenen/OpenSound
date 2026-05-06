@@ -88,11 +88,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         // Give the player access to local downloads so it uses file:// URLs
         playerManager.downloadRepo = downloadRepo
-        // Keep SoundCloud OAuth token + cobalt URL in sync with settings
+        // Keep SoundCloud settings in sync
         viewModelScope.launch {
             settings.collect { s ->
-                soundCloudApi.oauthToken = s.soundCloudOAuthToken
-                soundCloudApi.cobaltBaseUrl = s.cobaltUrl
+                soundCloudApi.oauthToken     = s.soundCloudOAuthToken
+                soundCloudApi.cobaltBaseUrl  = s.cobaltUrl
+                soundCloudApi.forcedClientId = s.soundCloudClientId
             }
         }
     }
@@ -209,7 +210,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         .maxByOrNull { it.value }
                         ?.key
 
-                    runCatching { soundCloudApi.getTrending(genre = genre, limit = 50) }.getOrDefault(emptyList())
+                    val sc = runCatching { soundCloudApi.getTrending(genre = genre, limit = 50) }.getOrDefault(emptyList())
+                    if (sc.isNotEmpty()) sc else audiusApi.getTrending(offset = off).tracks
                 }
                 rememberProviderIds(tracks)
                 _trending.update { if (off == 0) tracks else it + tracks }

@@ -230,17 +230,30 @@ fun SettingsScreen(viewModel: MainViewModel) {
 
         Section("SoundCloud account (optional)") {
             OutlinedTextField(
-                value = settings.soundCloudOAuthToken,
-                onValueChange = { v -> viewModel.updateSettings { it.copy(soundCloudOAuthToken = v.trim()) } },
-                label = { Text("OAuth token") },
+                value = settings.soundCloudClientId,
+                onValueChange = { v -> viewModel.updateSettings { it.copy(soundCloudClientId = v.trim()) } },
+                label = { Text("client_id") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
             Text(
-                "Paste an OAuth token from a logged-in SoundCloud web session (DevTools → Network → " +
-                    "any api-v2 request → Authorization: OAuth <token>). Used only for HTTP " +
-                    "requests to SoundCloud — sent as 'Authorization: OAuth <token>'. Leave blank for " +
-                    "anonymous mode (some tracks return 30-second previews).",
+                "SoundCloud client_id — required for SC trending and direct streaming. " +
+                    "Get it from DevTools → Network → any api-v2.soundcloud.com request → " +
+                    "?client_id=XXXX in the URL. If left blank the app tries a list of known IDs automatically.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
+            )
+            OutlinedTextField(
+                value = settings.soundCloudOAuthToken,
+                onValueChange = { v -> viewModel.updateSettings { it.copy(soundCloudOAuthToken = v.trim()) } },
+                label = { Text("OAuth token (optional, for Go+)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text(
+                "OAuth token unlocks full-length streams for Go+ subscribers. " +
+                    "Get it from DevTools → Network → Authorization: OAuth <token>.",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 6.dp)

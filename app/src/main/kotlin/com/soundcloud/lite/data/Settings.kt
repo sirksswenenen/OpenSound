@@ -159,6 +159,7 @@ data class AppSettings(
     val downloadSource: DownloadSource = DownloadSource.Auto,
     val cobaltUrl: String = "https://api.cobalt.tools",
     val soundCloudOAuthToken: String = "",
+    val soundCloudClientId: String = "",
     val iconVariant: IconVariant = IconVariant.Orange,
     val gradientBackground: Boolean = true,
     /**
@@ -197,6 +198,7 @@ class SettingsRepository(context: Context) {
         downloadSource = enumSafe<DownloadSource>(prefs.getString("dl_source", null)) ?: DownloadSource.Auto,
         cobaltUrl = prefs.getString("cobalt_url", "https://api.cobalt.tools") ?: "https://api.cobalt.tools",
         soundCloudOAuthToken = prefs.getString("sc_oauth_token", "") ?: "",
+        soundCloudClientId = prefs.getString("sc_client_id", "") ?: "",
         iconVariant = enumSafe<IconVariant>(prefs.getString("icon_variant", null)) ?: IconVariant.Orange,
         gradientBackground = prefs.getBoolean("gradient_bg", true),
         customAccent = prefs.getLong("custom_accent", 0xFFFF5500),
@@ -224,6 +226,7 @@ class SettingsRepository(context: Context) {
             .putString("dl_source", next.downloadSource.name)
             .putString("cobalt_url", next.cobaltUrl)
             .putString("sc_oauth_token", next.soundCloudOAuthToken)
+            .putString("sc_client_id", next.soundCloudClientId)
             .putString("icon_variant", next.iconVariant.name)
             .putBoolean("gradient_bg", next.gradientBackground)
             .putLong("custom_accent", next.customAccent)
