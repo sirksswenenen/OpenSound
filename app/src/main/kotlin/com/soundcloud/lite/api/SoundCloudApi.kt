@@ -1,5 +1,6 @@
 package com.soundcloud.lite.api
 
+import android.util.Log
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -7,120 +8,115 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
-/**
- * SoundCloud API client.
- *
- * client_id strategy (in order):
- *   1. Use [forcedClientId] if set (user can paste it in Settings).
- *   2. Try the known-working hardcoded fallback IDs (refreshed periodically
- *      by the community; the app will stop needing them if the user sets one).
- *   3. Scrape soundcloud.com for a fresh one (may fail due to Cloudflare).
- *
- * For streams the Cobalt API is tried first (no auth needed), then SC API-v2.
- */
 class SoundCloudApi(
     private val http: OkHttpClient = defaultHttp(),
 ) {
     private val cachedClientId = AtomicReference<String?>(null)
     var oauthToken: String = ""
     var cobaltBaseUrl: String = "https://api.cobalt.tools"
-
-    /** Set this from Settings to skip the scraping step entirely. */
     var forcedClientId: String = ""
 
-    // ── client_id ────────────────────────────────────────────────────────────
+    // ── client_id ─────────────────────────────────────────────────────────────
 
     fun clientId(): String? {
-        // 1. User-provided
         if (forcedClientId.isNotBlank()) return forcedClientId
-        // 2. Cached
         cachedClientId.get()?.let { return it }
-        // 3. Try hardcoded fallbacks (valid as of May 2025 — update periodically)
         for (id in KNOWN_CLIENT_IDS) {
             if (probeClientId(id)) {
+                Log.d(TAG, "Using known client_id: $id")
                 cachedClientId.set(id)
                 return id
             }
         }
-        // 4. Scrape
         val scraped = scrapeClientId()
         if (scraped != null) {
+            Log.d(TAG, "Scraped client_id: $scraped")
             cachedClientId.set(scraped)
             return scraped
         }
+        Log.w(TAG, "Could not obtain client_id")
         return null
     }
 
     private fun probeClientId(id: String): Boolean {
-        val resp = httpGetWithAuth(
-            "https://api-v2.soundcloud.com/tracks?ids=1&client_id=$id"
-        )
-        return resp != null && !resp.contains("\"error\"") && !resp.contains("\"status\":401")
+        val resp = httpGetRaw(
+            "https://api-v2.soundcloud.com/tracks?ids=1193518076&client_id=$id",
+            "OpenSound/1.0"
+        ) ?: return false
+        return !resp.contains("\"error\"") && !resp.contains("\"status\":401") && resp.contains("\"id\"")
     }
 
     private fun scrapeClientId(): String? {
-        val html = httpGet("https://soundcloud.com",
-            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        val html = httpGetRaw("https://soundcloud.com",
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36"
         ) ?: return null
         SC_CLIENT_ID_RE.find(html)?.groupValues?.get(1)?.let { return it }
         SC_ASSET_URL_RE.findAll(html)
             .map { it.groupValues[1] }.distinct().toList().takeLast(8)
             .forEach { url ->
-                val js = runCatching { httpGet(url, "OpenSound/1.0") }.getOrNull() ?: return@forEach
+                val js = httpGetRaw(url, "OpenSound/1.0") ?: return@forEach
                 SC_CLIENT_ID_RE.find(js)?.groupValues?.get(1)?.let { return it }
             }
         return null
     }
 
-    private fun invalidateClientId() {
-        cachedClientId.set(null)
-        KNOWN_CLIENT_IDS  // will be re-probed on next clientId() call
-    }
+    private fun invalidateClientId() = cachedClientId.set(null)
 
-    // ── Stream URLs ──────────────────────────────────────────────────────────
+    // ── Streams ────────────────────────────────────────────────────────────────
 
     data class StreamResult(val url: String, val isPreview: Boolean)
 
     /**
-     * Returns a playable stream URL for [trackId].
+     * Gets a playable stream URL for a SC track.
      *
-     * Order:
-     *   1. Cobalt API — no auth, handles previews/region locks
-     *   2. SC API-v2 /streams with client_id
+     * Strategy:
+     *   1. SC API-v2 /streams (fastest when client_id is available)
+     *   2. Cobalt API (fallback — works without client_id)
      */
     fun getStreamUrl(trackId: String, trackPermalink: String? = null): StreamResult? {
-        // 1. Cobalt (most reliable, no client_id needed)
-        val permalink = trackPermalink
-            ?: "https://soundcloud.com/tracks/$trackId"
-        getCobaltStreamUrl(permalink, cobaltBaseUrl)?.let {
-            return StreamResult(it, false)
+        // Method 1: SC API-v2 /streams
+        val cid = clientId()
+        if (cid != null) {
+            val auth = if (oauthToken.isNotBlank()) "&oauth_token=$oauthToken" else ""
+            val url = "https://api-v2.soundcloud.com/tracks/$trackId/streams?client_id=$cid$auth"
+            val json = httpGetRaw(url, "OpenSound/1.0")
+            Log.d(TAG, "streams response for $trackId: ${json?.take(200)}")
+            if (json != null) {
+                // SC returns: {"http_mp3_128_url":"...","hls_mp3_128_url":"...",...}
+                val mp3Url = extractJsonString(json, "\"http_mp3_128_url\"")
+                    ?: extractJsonString(json, "\"http_mp3_128\"")  // alt key
+                val previewUrl = extractJsonString(json, "\"preview_mp3_128_url\"")
+                    ?: extractJsonString(json, "\"preview\"")
+                Log.d(TAG, "mp3=$mp3Url preview=$previewUrl")
+                when {
+                    mp3Url != null -> return StreamResult(mp3Url, false)
+                    previewUrl != null -> return StreamResult(previewUrl, true)
+                }
+            }
         }
 
-        // 2. SC API-v2
-        val cid = clientId() ?: return null
-        val auth = if (oauthToken.isNotBlank()) "&oauth_token=$oauthToken" else ""
-        val json = httpGetWithAuth(
-            "https://api-v2.soundcloud.com/tracks/$trackId/streams?client_id=$cid$auth"
-        ) ?: run {
-            invalidateClientId()
-            val cid2 = clientId() ?: return null
-            httpGetWithAuth("https://api-v2.soundcloud.com/tracks/$trackId/streams?client_id=$cid2$auth")
-        } ?: return null
-
-        val fullUrl    = extractJsonString(json, "\"http_mp3_128_url\"")
-            ?: extractJsonString(json, "\"hls_mp3_128_url\"")
-        val previewUrl = extractJsonString(json, "\"preview_mp3_128_url\"")
-        return when {
-            fullUrl    != null -> StreamResult(fullUrl, false)
-            previewUrl != null -> StreamResult(previewUrl, true)
-            else               -> null
+        // Method 2: Cobalt
+        val permalink = trackPermalink?.takeIf { it.isNotBlank() }
+        if (permalink != null) {
+            Log.d(TAG, "Trying Cobalt for $permalink")
+            val cobaltUrl = getCobaltStreamUrl(permalink)
+            if (cobaltUrl != null) {
+                Log.d(TAG, "Cobalt succeeded: $cobaltUrl")
+                return StreamResult(cobaltUrl, false)
+            }
+        } else {
+            Log.w(TAG, "No permalink for track $trackId — can't use Cobalt")
         }
+
+        Log.w(TAG, "All stream methods failed for track $trackId")
+        return null
     }
 
     fun getCobaltStreamUrl(scUrl: String, cobaltBase: String = cobaltBaseUrl): String? {
         return try {
-            val body = """{"url":"${scUrl.replace("\"", "\\\"")}","audioFormat":"mp3","isAudioOnly":true}"""
-            val reqBody = body.toRequestBody("application/json; charset=utf-8".toMediaType())
+            // Cobalt API v7+ format
+            val body = """{"url":"${scUrl.replace("\"","\\\"") }","audioFormat":"mp3","isAudioOnly":true,"aFormat":"mp3","filenameStyle":"basic"}"""
+            val reqBody = body.toRequestBody("application/json".toMediaType())
             val req = Request.Builder()
                 .url("$cobaltBase/")
                 .post(reqBody)
@@ -128,58 +124,81 @@ class SoundCloudApi(
                 .header("Content-Type", "application/json")
                 .build()
             http.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return null
                 val json = resp.body?.string() ?: return null
+                Log.d(TAG, "Cobalt resp ${resp.code}: ${json.take(200)}")
+                if (!resp.isSuccessful) return null
+                // {"status":"stream"|"redirect"|"tunnel","url":"..."}
                 extractJsonString(json, "\"url\"")
             }
-        } catch (_: Exception) { null }
+        } catch (e: Exception) {
+            Log.e(TAG, "Cobalt error: $e")
+            null
+        }
     }
 
-    // ── Trending ─────────────────────────────────────────────────────────────
+    // ── Trending ───────────────────────────────────────────────────────────────
 
     fun getTrending(genre: String? = null, limit: Int = 50): List<TrackInfo> {
-        val cid = clientId() ?: return emptyList()
+        val cid = clientId() ?: run {
+            Log.w(TAG, "getTrending: no client_id")
+            return emptyList()
+        }
         val genreParam = if (genre != null)
-            "&genre=soundcloud%3Agenres%3A${java.net.URLEncoder.encode(genre, "UTF-8")}"
-        else ""
-        val json = httpGetWithAuth(
-            "https://api-v2.soundcloud.com/charts?kind=top&limit=$limit$genreParam&client_id=$cid"
-        ) ?: return emptyList()
-        return parseCollection(json)
-    }
-
-    fun getRelated(trackId: String, limit: Int = 20): List<TrackInfo> {
-        val cid = clientId() ?: return emptyList()
-        val json = httpGetWithAuth(
-            "https://api-v2.soundcloud.com/tracks/$trackId/related?limit=$limit&client_id=$cid"
-        ) ?: return emptyList()
+            "&genre=soundcloud%3Agenres%3A${java.net.URLEncoder.encode(genre, "UTF-8")}" else ""
+        val url = "https://api-v2.soundcloud.com/charts?kind=top&limit=$limit$genreParam&client_id=$cid"
+        Log.d(TAG, "getTrending: $url")
+        val json = httpGetRaw(url, "OpenSound/1.0") ?: run {
+            Log.w(TAG, "getTrending: null response")
+            return emptyList()
+        }
+        Log.d(TAG, "getTrending response: ${json.take(300)}")
         return parseCollection(json)
     }
 
     fun search(query: String, limit: Int = 10): List<TrackInfo> {
         val cid = clientId() ?: return emptyList()
         val q = java.net.URLEncoder.encode(query, "UTF-8")
-        val json = httpGetWithAuth(
-            "https://api-v2.soundcloud.com/search/tracks?q=$q&limit=$limit&client_id=$cid"
+        val json = httpGetRaw(
+            "https://api-v2.soundcloud.com/search/tracks?q=$q&limit=$limit&client_id=$cid",
+            "OpenSound/1.0"
         ) ?: return emptyList()
         return parseCollection(json)
     }
 
-    // ── JSON parsing ─────────────────────────────────────────────────────────
+    fun getRelated(trackId: String, limit: Int = 20): List<TrackInfo> {
+        val cid = clientId() ?: return emptyList()
+        val json = httpGetRaw(
+            "https://api-v2.soundcloud.com/tracks/$trackId/related?limit=$limit&client_id=$cid",
+            "OpenSound/1.0"
+        ) ?: return emptyList()
+        return parseCollection(json)
+    }
+
+    // ── JSON parsing ───────────────────────────────────────────────────────────
 
     private fun parseCollection(json: String): List<TrackInfo> {
-        val arrStart = if (json.trimStart().startsWith('[')) json.indexOf('[')
-        else {
-            val ci = json.indexOf("\"collection\""); if (ci < 0) return emptyList()
+        // Response can be {"collection":[...]} or [...]
+        val trimmed = json.trimStart()
+        val arrStart = if (trimmed.startsWith('[')) {
+            json.indexOf('[')
+        } else {
+            val ci = json.indexOf("\"collection\"")
+            if (ci < 0) {
+                Log.w(TAG, "No 'collection' key and not array: ${json.take(100)}")
+                return emptyList()
+            }
             json.indexOf('[', ci)
         }
         if (arrStart < 0) return emptyList()
         val arrJson = extractJsonArray(json, arrStart) ?: return emptyList()
-        return splitJsonObjects(arrJson).mapNotNull { parseTrack(it) }
+        val objects = splitJsonObjects(arrJson)
+        Log.d(TAG, "parseCollection: ${objects.size} objects")
+        return objects.mapNotNull { parseTrack(it) }
     }
 
     private fun parseTrack(obj: String): TrackInfo? {
-        val trackObj = if (obj.contains("\"track\""))
+        // Charts endpoint wraps track in {"score":...,"track":{...}}
+        val trackObj = if (obj.contains("\"track\"") && obj.contains("\"score\""))
             extractJsonObjectBlock(obj, "\"track\"") ?: obj
         else obj
 
@@ -187,15 +206,15 @@ class SoundCloudApi(
         val title = extractJsonString(trackObj, "\"title\"") ?: return null
         if (title.isBlank()) return null
 
-        val userBlock  = extractJsonObjectBlock(trackObj, "\"user\"")
-        val artist     = if (userBlock != null) extractJsonString(userBlock, "\"username\"") ?: "" else ""
-        val artwork    = extractJsonString(trackObj, "\"artwork_url\"")
-            ?.replace("-large.", "-t500x500.")?.takeIf { it.isNotBlank() }
+        val userBlock = extractJsonObjectBlock(trackObj, "\"user\"")
+        val artist    = if (userBlock != null) extractJsonString(userBlock, "\"username\"") ?: "" else ""
+        val artworkRaw = extractJsonString(trackObj, "\"artwork_url\"") ?: ""
+        val artwork = if (artworkRaw.isNotBlank())
+            artworkRaw.replace("-large.", "-t500x500.") else null
         val durationMs = extractJsonNumber(trackObj, "\"duration\"")?.toLongOrNull() ?: 0L
         val genre      = extractJsonString(trackObj, "\"genre\"")
         val playCount  = extractJsonNumber(trackObj, "\"playback_count\"")?.toLongOrNull()
         val permalink  = extractJsonString(trackObj, "\"permalink_url\"")
-        val streamable = extractJsonString(trackObj, "\"streamable\"")
 
         return TrackInfo(
             id          = AudiusApi.stableIdHash("sc:$id"),
@@ -208,52 +227,59 @@ class SoundCloudApi(
             genre       = genre,
             playCount   = playCount,
             permalink   = permalink,
-            isUnplayable = streamable == "false",
+            isUnplayable = false,
         )
     }
 
-    // ── HTTP ─────────────────────────────────────────────────────────────────
+    // ── HTTP ───────────────────────────────────────────────────────────────────
 
-    fun httpGetWithAuth(url: String): String? {
+    fun httpGetRaw(url: String, ua: String): String? = try {
         val b = Request.Builder().url(url)
-            .header("User-Agent", "OpenSound/1.0 (Android)")
-            .header("Accept", "application/json")
+            .header("User-Agent", ua)
+            .header("Accept", "application/json, text/html, */*")
+            .header("Accept-Language", "en-US,en;q=0.9")
         if (oauthToken.isNotBlank()) b.header("Authorization", "OAuth $oauthToken")
-        return try { http.newCall(b.build()).execute().use { r -> if (!r.isSuccessful) null else r.body?.string() } }
-        catch (_: Exception) { null }
+        http.newCall(b.build()).execute().use { r ->
+            if (!r.isSuccessful) {
+                Log.w(TAG, "HTTP ${r.code} for $url")
+                null
+            } else r.body?.string()
+        }
+    } catch (e: Exception) {
+        Log.e(TAG, "httpGet error for $url: $e")
+        null
     }
 
-    private fun httpGet(url: String, ua: String): String? = try {
-        val req = Request.Builder().url(url)
-            .header("User-Agent", ua)
-            .header("Accept", "text/html,application/json,*/*")
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .build()
-        http.newCall(req).execute().use { r -> if (!r.isSuccessful) null else r.body?.string() }
-    } catch (_: Exception) { null }
+    // ── JSON helpers ───────────────────────────────────────────────────────────
 
-    // ── JSON helpers ──────────────────────────────────────────────────────────
-
-    private fun extractJsonString(block: String, key: String): String? {
-        val idx = block.indexOf(key); if (idx < 0) return null
-        val colon = block.indexOf(':', idx + key.length); if (colon < 0) return null
-        var i = colon + 1
-        while (i < block.length && block[i].isWhitespace()) i++
-        if (i >= block.length || block[i] == 'n') return null
-        if (block[i] != '"') return null; i++
-        val sb = StringBuilder()
-        while (i < block.length) {
-            val c = block[i]
-            if (c == '\\' && i + 1 < block.length) {
-                when (val n = block[++i]) {
-                    'n' -> sb.append('\n'); 't' -> sb.append('\t')
-                    '\\' -> sb.append('\\'); '"' -> sb.append('"'); '/' -> sb.append('/')
-                    'u' -> if (i + 4 < block.length) { runCatching { sb.append(block.substring(i+1, i+5).toInt(16).toChar()) }; i += 4 }
-                    else -> sb.append(n)
-                }
-            } else if (c == '"') return sb.toString()
-            else sb.append(c)
+    fun extractJsonString(block: String, key: String): String? {
+        var searchFrom = 0
+        while (searchFrom < block.length) {
+            val idx = block.indexOf(key, searchFrom); if (idx < 0) return null
+            val colon = block.indexOf(':', idx + key.length); if (colon < 0) return null
+            var i = colon + 1
+            while (i < block.length && block[i].isWhitespace()) i++
+            if (i >= block.length) return null
+            if (block[i] == 'n') { searchFrom = idx + 1; continue } // null value, keep searching
+            if (block[i] != '"') { searchFrom = idx + 1; continue }
             i++
+            val sb = StringBuilder()
+            while (i < block.length) {
+                val c = block[i]
+                if (c == '\\' && i + 1 < block.length) {
+                    when (val n = block[++i]) {
+                        'n' -> sb.append('\n'); 't' -> sb.append('\t')
+                        '\\' -> sb.append('\\'); '"' -> sb.append('"'); '/' -> sb.append('/')
+                        'u' -> if (i + 4 < block.length) {
+                            runCatching { sb.append(block.substring(i+1, i+5).toInt(16).toChar()) }; i += 4
+                        }
+                        else -> sb.append(n)
+                    }
+                } else if (c == '"') return sb.toString().ifEmpty { null }
+                else sb.append(c)
+                i++
+            }
+            return null
         }
         return null
     }
@@ -284,13 +310,16 @@ class SoundCloudApi(
         var inStr = false; var esc = false
         while (i < json.length) {
             val c = json[i]
-            when { esc -> { sb.append(c); esc = false }
+            when {
+                esc -> { sb.append(c); esc = false }
                 c == '\\' && inStr -> { sb.append(c); esc = true }
                 c == '"' -> { sb.append(c); inStr = !inStr }
                 inStr -> sb.append(c)
                 c == '{' -> { depth++; sb.append(c) }
                 c == '}' -> { depth--; sb.append(c); if (depth == 0) return sb.toString() }
-                else -> sb.append(c) }; i++ }
+                else -> sb.append(c)
+            }; i++
+        }
         return null
     }
 
@@ -300,13 +329,16 @@ class SoundCloudApi(
         var inStr = false; var esc = false
         while (i < json.length) {
             val c = json[i]
-            when { esc -> { sb.append(c); esc = false }
+            when {
+                esc -> { sb.append(c); esc = false }
                 c == '\\' && inStr -> { sb.append(c); esc = true }
                 c == '"' -> { sb.append(c); inStr = !inStr }
                 inStr -> sb.append(c)
                 c == '[' -> { depth++; sb.append(c) }
                 c == ']' -> { depth--; sb.append(c); if (depth == 0) return sb.toString() }
-                else -> sb.append(c) }; i++ }
+                else -> sb.append(c)
+            }; i++
+        }
         return null
     }
 
@@ -315,13 +347,16 @@ class SoundCloudApi(
         while (i < arrayJson.length) {
             if (arrayJson[i] == '{') {
                 val obj = extractJsonObject(arrayJson, i)
-                if (obj != null) { result += obj; i += obj.length; continue } }; i++ }
+                if (obj != null) { result += obj; i += obj.length; continue }
+            }; i++
+        }
         return result
     }
 
     companion object {
-        // Known-working SC client_ids (community-maintained; probe before use)
-        // These are the most recently confirmed valid IDs — update periodically.
+        private const val TAG = "SoundCloudApi"
+
+        // Known valid SC client_ids — update when these expire
         private val KNOWN_CLIENT_IDS = listOf(
             "iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX",
             "a3e059563d7fd3372b49b37f00a00bcf",

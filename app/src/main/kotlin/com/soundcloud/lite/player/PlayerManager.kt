@@ -47,7 +47,7 @@ class PlayerManager(
     private fun resolveStreamUrl(track: TrackInfo): String? {
         // Prefer local file if available
         downloadRepo?.getLocalPath(track.id)?.let { return "file://$it" }
-        return when (track.provider) {
+        val url = when (track.provider) {
             Provider.AUDIUS -> if (track.providerId.isNotBlank()) audius.streamUrl(track.providerId) else null
             Provider.YOUTUBE -> if (track.providerId.isNotBlank()) youtube.streamUrl(track.providerId) else null
             Provider.SOUNDCLOUD -> if (track.providerId.isNotBlank())
@@ -57,6 +57,8 @@ class PlayerManager(
                 )?.url else null
             Provider.UNKNOWN -> null
         }
+        android.util.Log.d("PlayerManager", "resolveStreamUrl ${track.provider} id=${track.providerId} permalink=${track.permalink} -> $url")
+        return url
     }
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 

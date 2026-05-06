@@ -188,8 +188,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ---- Trending ----
 
     fun loadTrending() {
-        // Always refresh — SC trending is not paginated
-        if (_trending.value.isNotEmpty() && nextTrendingOffset == null) return
         nextTrendingOffset = 0
         loadMoreTrending()
     }
