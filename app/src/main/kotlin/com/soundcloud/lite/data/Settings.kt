@@ -82,10 +82,13 @@ enum class AnimSpeed(val displayName: String, val millis: Int) {
     Normal("Normal", 250);
 }
 
+/**
+ * Legacy. We used to support a Cobalt API fallback for downloads; v0.5.0
+ * uses SoundCloud's `streams` endpoint exclusively. The enum is kept (with
+ * a single member) so persisted settings still deserialize.
+ */
 enum class DownloadSource(val displayName: String) {
-    Auto("Auto (direct, then Cobalt)"),
-    Direct("Direct (SoundCloud stream)"),
-    Cobalt("Cobalt (external API)");
+    Auto("SoundCloud stream");
 }
 
 enum class IconVariant(val displayName: String, val aliasSuffix: String?) {
@@ -157,7 +160,6 @@ data class AppSettings(
     val glassTintColor: Long = 0xFF1A0037L,
     val animationSpeed: AnimSpeed = AnimSpeed.Fast,
     val downloadSource: DownloadSource = DownloadSource.Auto,
-    val cobaltUrl: String = "https://api.cobalt.tools",
     val soundCloudOAuthToken: String = "",
     val soundCloudClientId: String = "",
     val iconVariant: IconVariant = IconVariant.Orange,
@@ -196,7 +198,6 @@ class SettingsRepository(context: Context) {
         glassTintColor = prefs.getLong("glass_tint_color", 0xFF1A0037L),
         animationSpeed = enumSafe<AnimSpeed>(prefs.getString("anim_speed", null)) ?: AnimSpeed.Fast,
         downloadSource = enumSafe<DownloadSource>(prefs.getString("dl_source", null)) ?: DownloadSource.Auto,
-        cobaltUrl = prefs.getString("cobalt_url", "https://api.cobalt.tools") ?: "https://api.cobalt.tools",
         soundCloudOAuthToken = prefs.getString("sc_oauth_token", "") ?: "",
         soundCloudClientId = prefs.getString("sc_client_id", "") ?: "",
         iconVariant = enumSafe<IconVariant>(prefs.getString("icon_variant", null)) ?: IconVariant.Orange,
@@ -224,7 +225,6 @@ class SettingsRepository(context: Context) {
             .putLong("glass_tint_color", next.glassTintColor)
             .putString("anim_speed", next.animationSpeed.name)
             .putString("dl_source", next.downloadSource.name)
-            .putString("cobalt_url", next.cobaltUrl)
             .putString("sc_oauth_token", next.soundCloudOAuthToken)
             .putString("sc_client_id", next.soundCloudClientId)
             .putString("icon_variant", next.iconVariant.name)
