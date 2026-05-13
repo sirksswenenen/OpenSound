@@ -1,133 +1,266 @@
 package com.soundcloud.lite.ui.components
 
+import android.graphics.RenderEffect as AndroidRenderEffect
+import android.graphics.RuntimeShader
+import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.asComposeRenderEffect
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.layer.GraphicsLayer
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.soundcloud.lite.ui.theme.LocalSCTheme
-import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.HazeStyle
-import dev.chrisbanes.haze.HazeTint
-import dev.chrisbanes.haze.hazeEffect
 
 /**
- * App-wide [HazeState] used by [LiquidGlassCapsule]. Whatever content
- * we want the capsule to refract must be marked with
- * `Modifier.hazeSource(LocalHazeState.current)` somewhere up the tree.
+ * AGSL refraction shader vendored from
+ * https://github.com/Kyant0/AndroidLiquidGlass (Apache 2.0).
  *
- * In practice we mark:
- *  - the whole `AppNavHost` (so the capsule refracts the scrolling
- *    list / album art behind the bar)
- *  - the row of bottom-nav icons themselves (so the icons distort as
- *    the capsule slides over them — that's the iPhone "Liquid Glass"
- *    signature)
+ * The shader treats its bound `content` sampler (a GraphicsLayer
+ * holding the backdrop pixels) as a flat plane and bends sampling
+ * coordinates near the rounded-rect's edges to produce the iOS
+ * "Liquid Glass" lens distortion — content close to the rim is
+ * pulled outwards (refracted), content near the centre passes
+ * through unchanged.
  *
- * The state is provided in [MainActivity]; a default (empty) is
- * returned for previews / tests that don't wire it up.
+ * Uniforms:
+ *  - `size` — pixel dimensions of the lens
+ *  - `offset` — translation of (0,0) inside the source layer
+ *               (always (0,0) for us; the caller is responsible
+ *                for translating the source layer before draw)
+ *  - `cornerRadii` — TL, TR, BR, BL radii in pixels
+ *  - `refractionHeight` — thickness (px) of the refracting rim
+ *  - `refractionAmount` — how far rim coords are pushed outwards
+ *                          (px). Higher = stronger lens.
+ *  - `depthEffect` — 0..1, blends the rim normal with the radial
+ *                     normal for a fish-eye feel; 0 is plain rim.
+ *
+ * Requires Android 13 (API 33, TIRAMISU) and a working AGSL stack.
  */
-val LocalHazeState = compositionLocalOf<HazeState?> { null }
+private const val RefractionShaderSrc = """
+uniform shader content;
+
+uniform float2 size;
+uniform float2 offset;
+uniform float4 cornerRadii;
+uniform float refractionHeight;
+uniform float refractionAmount;
+uniform float depthEffect;
+
+float radiusAt(float2 coord, float4 radii) {
+    if (coord.x >= 0.0) {
+        if (coord.y <= 0.0) return radii.y;
+        else return radii.z;
+    } else {
+        if (coord.y <= 0.0) return radii.x;
+        else return radii.w;
+    }
+}
+
+float sdRoundedRect(float2 coord, float2 halfSize, float radius) {
+    float2 cornerCoord = abs(coord) - (halfSize - float2(radius));
+    float outside = length(max(cornerCoord, 0.0)) - radius;
+    float inside = min(max(cornerCoord.x, cornerCoord.y), 0.0);
+    return outside + inside;
+}
+
+float2 gradSdRoundedRect(float2 coord, float2 halfSize, float radius) {
+    float2 cornerCoord = abs(coord) - (halfSize - float2(radius));
+    if (cornerCoord.x >= 0.0 || cornerCoord.y >= 0.0) {
+        return sign(coord) * normalize(max(cornerCoord, 0.0));
+    } else {
+        float gradX = step(cornerCoord.y, cornerCoord.x);
+        return sign(coord) * float2(gradX, 1.0 - gradX);
+    }
+}
+
+float circleMap(float x) {
+    return 1.0 - sqrt(1.0 - x * x);
+}
+
+half4 main(float2 coord) {
+    float2 halfSize = size * 0.5;
+    float2 centeredCoord = (coord + offset) - halfSize;
+    float radius = radiusAt(coord, cornerRadii);
+
+    float sd = sdRoundedRect(centeredCoord, halfSize, radius);
+    if (-sd >= refractionHeight) {
+        return content.eval(coord);
+    }
+    sd = min(sd, 0.0);
+
+    float d = circleMap(1.0 - -sd / refractionHeight) * refractionAmount;
+    float gradRadius = min(radius * 1.5, min(halfSize.x, halfSize.y));
+    float2 grad = normalize(
+        gradSdRoundedRect(centeredCoord, halfSize, gradRadius)
+            + depthEffect * normalize(centeredCoord)
+    );
+
+    float2 refractedCoord = coord + d * grad;
+    return content.eval(refractedCoord);
+}
+"""
 
 /**
- * The active-tab indicator pill at the bottom of the screen. Renders
- * as a real piece of frosted glass — backdrop blur + tint + a subtle
- * top-edge highlight whose intensity is driven by the user's
- * `glassHighlight` slider (0..1).
+ * iOS-style "Liquid Glass" capsule. Draws the supplied
+ * [backdropLayer] (translated so that the source pixels at
+ * [backdropOffset] land at the capsule's origin) through an AGSL
+ * refraction shader, producing a lens that visibly distorts
+ * whatever was rendered into the backdrop layer.
  *
- * Implementation uses [Haze](https://github.com/chrisbanes/haze)
- * 1.7.2, which:
- *  - On API 32+ uses `RenderEffect.createBlurEffect` (GPU)
- *  - On lower API falls back to a snapshot+CPU-blur pipeline
- *  - Automatically refraction-tracks position changes
- *
- * Falls back to a plain translucent box if no [LocalHazeState] is
- * provided (defensive — should never happen in the real app).
+ * Falls back to a soft translucent surface on pre-Tiramisu devices
+ * or when no backdrop is supplied.
  */
 @Composable
 fun LiquidGlassCapsule(
     modifier: Modifier = Modifier,
-    shape: Shape,
+    cornerRadiusDp: androidx.compose.ui.unit.Dp = 24.dp,
+    backdropLayer: GraphicsLayer? = null,
     /**
-     * Override for the HazeState the capsule should use as its lens
-     * source. When null, falls back to [LocalHazeState]. Callers that
-     * also drive sibling `hazeSource` modifiers should pass the SAME
-     * instance here to guarantee both ends share state.
+     * Offset, in pixels, of the capsule's top-left inside the
+     * backdrop layer's coordinate space. Read on every draw so an
+     * animated capsule position stays in sync with the refraction.
      */
-    hazeStateOverride: dev.chrisbanes.haze.HazeState? = null,
-    /** 0..1 — extra brightness on the top edge for a "lit" glass look.
-     *  Multiplied by the global `glassHighlight` slider. */
-    highlight: Float = 1.0f,
-    /** Base capsule tint; alpha is multiplied by the effective blur so the
-     *  pill fades out cleanly when blur is dialled down. */
-    tintColor: Color = Color.White.copy(alpha = 0.18f),
+    backdropOffset: () -> Offset = { Offset.Zero },
 ) {
     val theme = LocalSCTheme.current
-    val hazeState = hazeStateOverride ?: LocalHazeState.current
+    val density = LocalDensity.current
 
-    val effectiveHighlight = (highlight * theme.glassHighlight).coerceIn(0f, 1f)
-    // Driven directly by user's Settings → Glass surfaces → Blur slider.
-    val blurAmount = theme.glassBlur.coerceIn(0f, 1f)
-    // Blur radius scales from 6 dp (subtle, "barely a lens") to 40 dp
-    // (fully iOS-Liquid-Glass, everything underneath mushed into a
-    // frosted bead). The lower bound is deliberately above zero so the
-    // pill is always clearly a lens, never just a flat tint — that
-    // matches iOS where the pill is *always* refracting.
-    val blurRadiusDp = (6f + 34f * blurAmount)
-    // Tint is intentionally light so the lens effect (refracted icons,
-    // refracted screen content) reads through.
-    val tintAlpha = (0.06f + 0.12f * blurAmount).coerceIn(0f, 1f)
+    // 0..1 user setting controlling how aggressive the refraction
+    // is. We always want SOME lens, otherwise the pill turns into a
+    // plain tinted box — so we clamp the lower end above zero.
+    val refractAmount = theme.glassBlur.coerceIn(0f, 1f)
+    val refractionHeightPx = with(density) {
+        (8.dp + 22.dp * refractAmount).toPx()
+    }
+    val refractionAmountPx = with(density) {
+        (10.dp + 28.dp * refractAmount).toPx()
+    }
 
-    if (hazeState == null) {
-        // Defensive fallback: tinted plain box. Shouldn't be hit in app.
+    val highlightStrength = (theme.glassHighlight).coerceIn(0f, 1f)
+    val tintStrength = (theme.glassTint).coerceIn(0f, 1f)
+
+    val shape = RoundedCornerShape(cornerRadiusDp)
+
+    val canRefract =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && backdropLayer != null
+
+    if (!canRefract) {
+        // No GPU shader path available — give the user a still
+        // recognisable frosted pill instead of nothing.
         Box(
             modifier = modifier
                 .clip(shape)
-                .background(tintColor),
-        )
+                .background(Color.White.copy(alpha = 0.10f + 0.10f * tintStrength)),
+        ) {
+            CapsuleHighlight(highlightStrength)
+        }
         return
     }
 
-    // Haze 1.5.4 throws IllegalArgumentException("backgroundColor not
-    // specified") when drawing with Color.Unspecified. Transparent gives
-    // the same visual result (no opaque backdrop layer) without crashing.
-    val style = HazeStyle(
-        backgroundColor = Color.Transparent,
-        tints = listOf(
-            HazeTint(tintColor.copy(alpha = tintAlpha)),
-        ),
-        blurRadius = blurRadiusDp.dp,
-        noiseFactor = 0f,
-    )
+    var sizePx by remember { mutableStateOf(IntSize.Zero) }
+    val cornerRadiusPx = with(density) { cornerRadiusDp.toPx() }
 
-    Box(
-        modifier = modifier
-            .clip(shape)
-            .hazeEffect(state = hazeState, style = style),
-    ) {
-        // A soft top-edge specular highlight that gives the pill its
-        // "polished bead" look. Drawn ABOVE the haze blur as a thin
-        // gradient overlay; alpha = 0 fully removes it.
-        if (effectiveHighlight > 0.01f) {
-            Box(
-                modifier = Modifier
-                    .matchParentSize()
-                    .clip(shape)
-                    .background(
-                        brush = androidx.compose.ui.graphics.Brush.verticalGradient(
-                            0f to Color.White.copy(
-                                alpha = 0.35f * effectiveHighlight,
-                            ),
-                            0.45f to Color.Transparent,
-                            1f to Color.White.copy(
-                                alpha = 0.06f * effectiveHighlight,
-                            ),
-                        ),
-                    ),
+    val renderEffect = remember(sizePx, cornerRadiusPx, refractionHeightPx, refractionAmountPx) {
+        if (sizePx.width <= 0 || sizePx.height <= 0) {
+            null
+        } else {
+            val shader = RuntimeShader(RefractionShaderSrc)
+            shader.setFloatUniform(
+                "size",
+                sizePx.width.toFloat(),
+                sizePx.height.toFloat(),
             )
+            shader.setFloatUniform("offset", 0f, 0f)
+            shader.setFloatUniform(
+                "cornerRadii",
+                cornerRadiusPx,
+                cornerRadiusPx,
+                cornerRadiusPx,
+                cornerRadiusPx,
+            )
+            shader.setFloatUniform("refractionHeight", refractionHeightPx)
+            // Shader pushes coords outwards along the gradient when
+            // `refractionAmount` is negative — matching how the
+            // upstream library invokes it.
+            shader.setFloatUniform("refractionAmount", -refractionAmountPx)
+            shader.setFloatUniform("depthEffect", 0f)
+            AndroidRenderEffect
+                .createRuntimeShaderEffect(shader, "content")
+                .asComposeRenderEffect()
         }
     }
+
+    Box(modifier = modifier.clip(shape)) {
+        // Refraction lens — drawBehind paints the backdrop layer
+        // INTO this Box's graphicsLayer; the layer's renderEffect
+        // then refracts those pixels via the AGSL shader before
+        // they hit the screen.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .onSizeChanged { sizePx = it }
+                .graphicsLayer {
+                    this.renderEffect = renderEffect
+                    // Offscreen so the renderEffect sees the layer's
+                    // pixels (drawBehind contents) as `content`.
+                    compositingStrategy = CompositingStrategy.Offscreen
+                }
+                .drawBehind {
+                    val off = backdropOffset()
+                    // The shader samples `content` at coord =
+                    // capsule pixel. So we need the backdrop's
+                    // pixel at (off.x + capsule_x, off.y +
+                    // capsule_y) to land at (capsule_x, capsule_y).
+                    // Achieved by translating the backdrop layer
+                    // by -off before drawing it.
+                    withTransform({ translate(-off.x, -off.y) }) {
+                        drawLayer(backdropLayer)
+                    }
+                },
+        )
+        // Glossy rim highlight rendered OUTSIDE the refraction
+        // layer so it stays a crisp specular gradient instead of
+        // being warped by the shader.
+        CapsuleHighlight(highlightStrength)
+    }
+}
+
+/**
+ * Thin specular highlight along the top edge of the capsule.
+ * Drawn ABOVE the refraction so the pill always reads as a
+ * glossy 3-D bead and not a flat lens.
+ */
+@Composable
+private fun CapsuleHighlight(strength: Float) {
+    if (strength <= 0.01f) return
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                brush = Brush.verticalGradient(
+                    0f to Color.White.copy(alpha = 0.30f * strength),
+                    0.35f to Color.White.copy(alpha = 0.10f * strength),
+                    1f to Color.Transparent,
+                ),
+            ),
+    )
 }

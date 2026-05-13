@@ -81,9 +81,6 @@ import com.soundcloud.lite.ui.screens.SearchScreen
 import com.soundcloud.lite.ui.screens.SettingsScreen
 import com.soundcloud.lite.ui.components.BackdropHost
 import com.soundcloud.lite.ui.components.LocalBackdropLayer
-import com.soundcloud.lite.ui.components.LocalHazeState
-import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.hazeSource
 import com.soundcloud.lite.ui.components.LocalBlurredBackdrop
 import com.soundcloud.lite.ui.components.LocalBlurredBackdropScale
 import com.soundcloud.lite.ui.components.LocalTilt
@@ -290,11 +287,6 @@ fun AppRoot(viewModel: MainViewModel) {
     // therefore seeing the plain coloured pill (looked like a "glow")
     // instead of the refracting lens.
     val glassOn = LocalSCTheme.current.glassEnabled
-
-    // Single app-wide HazeState used by the bottom-nav capsule to
-    // backdrop-blur whatever is underneath it (screen content AND
-    // the row of nav icons). See LiquidGlassCapsule docs.
-    val hazeState = androidx.compose.runtime.remember { HazeState() }
 
     // GraphicsLayer capturing the list/AppNavHost content so the
     // MiniPlayer overlay can sample it for backdrop blur. Only
@@ -619,7 +611,6 @@ fun AppRoot(viewModel: MainViewModel) {
                     LocalTilt provides tilt,
                     LocalBlurredBackdrop provides blurredBackdrop,
                     LocalBlurredBackdropScale provides captureScale,
-                    LocalHazeState provides hazeState,
                 ) {
                     GlassNavigationBar(
                         tabs = bottomTabs,
@@ -703,7 +694,7 @@ fun AppRoot(viewModel: MainViewModel) {
                         .matchParentSize()
                         .background(bgBrush)
                 )
-                Box(modifier = Modifier.fillMaxSize().hazeSource(state = hazeState)) {
+                Box(modifier = Modifier.fillMaxSize()) {
                     AppNavHost(navController = navController, viewModel = viewModel)
                 }
             }
@@ -782,41 +773,55 @@ private fun GlassNavigationBar(
             val capsuleWidth = cellWidth - capsuleInset * 2
             val barHeight = 64.dp
 
+            // Backdrop layer that holds a snapshot of the bar's icon
+            // row. The capsule reads from it through an AGSL
+            // refraction shader, which is what produces the iOS
+            // "Liquid Glass" lens — icons under the moving capsule
+            // visibly distort while icons outside stay crisp.
+            //
+            // (Yes, every recomposition of this bar reallocates the
+            //  layer if you don't memoise — `rememberGraphicsLayer`
+            //  handles that for us and disposes the GPU resource on
+            //  exit.)
+            val barBackdropLayer = rememberGraphicsLayer()
+            val capsuleDensity = LocalDensity.current
+            val capsuleInsetPx = with(capsuleDensity) { capsuleInset.toPx() }
+            val cellWidthPx = with(capsuleDensity) { cellWidth.toPx() }
+
             val barContent: @Composable () -> Unit = {
                 // The bar is rendered in three z-stacked layers so that
                 // the Liquid Glass capsule actually behaves like a lens
                 // moving across the icons (the iPhone-style effect):
                 //
-                //   1. Icons row, marked as `hazeSource`. Drawn first so
-                //      it's "behind" the capsule. Inside this row we
-                //      DO NOT attach click handlers — those go on layer
-                //      3, so the capsule visually covers the icons but
-                //      taps still pass through.
-                //   2. The sliding capsule (`hazeEffect`). Drawn on top
-                //      of the icons. Where it overlaps an icon, the
-                //      icon is rendered blurred / tinted through the
-                //      lens; outside the capsule the icons stay crisp.
+                //   1. Icons row, recorded into `barBackdropLayer` AND
+                //      drawn normally. This row has no click handlers
+                //      — those go on layer 3 — so the capsule visually
+                //      covers the icons but taps still pass through.
+                //   2. The sliding capsule. Reads from
+                //      `barBackdropLayer` through an AGSL refraction
+                //      shader. Where it overlaps an icon, the icon is
+                //      rendered visibly distorted; outside the
+                //      capsule the icons stay crisp.
                 //   3. A transparent row of click hit-boxes on top of
                 //      everything. Forwards taps to `onSelect`.
                 Box(modifier = Modifier.fillMaxWidth().height(barHeight)) {
-                    // Resolve the app-wide HazeState exactly ONCE here.
-                    // We pass the SAME instance to both the icons row's
-                    // hazeSource and the capsule's hazeEffect so they
-                    // share state. Earlier versions accidentally created
-                    // a fresh HazeState as a per-recomposition fallback,
-                    // which silently broke the lens (effect couldn't see
-                    // the icons because they were registered in a
-                    // different HazeState instance).
-                    val providedHaze = LocalHazeState.current
-                    val sharedHaze = remember(providedHaze) {
-                        providedHaze ?: HazeState()
-                    }
-
-                    // ── layer 1: visual icons (haze source) ──────────
+                    // ── layer 1: visual icons, captured into the
+                    // backdrop layer the capsule samples from ──────
                     Row(
                         modifier = Modifier
                             .fillMaxSize()
-                            .hazeSource(state = sharedHaze),
+                            .drawWithContent {
+                                // Record icons row pixels into the
+                                // GraphicsLayer (so the capsule has
+                                // something to refract), then ALSO
+                                // draw them normally to the canvas
+                                // (so the user sees the icons outside
+                                // the capsule region).
+                                barBackdropLayer.record {
+                                    this@drawWithContent.drawContent()
+                                }
+                                drawLayer(barBackdropLayer)
+                            },
                     ) {
                         tabs.forEach { tab ->
                             val selected = currentRoute == tab.route
@@ -866,8 +871,21 @@ private fun GlassNavigationBar(
                         if (glassOn) {
                             com.soundcloud.lite.ui.components.LiquidGlassCapsule(
                                 modifier = Modifier.fillMaxSize(),
-                                shape = capsuleShape,
-                                hazeStateOverride = sharedHaze,
+                                cornerRadiusDp = 24.dp,
+                                backdropLayer = barBackdropLayer,
+                                backdropOffset = {
+                                    // Capsule lives at
+                                    // (cellWidthPx * animatedIndex +
+                                    // capsuleInsetPx, capsuleInsetPx)
+                                    // inside the bar; the shader
+                                    // needs that offset so it samples
+                                    // the matching slice of the
+                                    // captured icons row.
+                                    Offset(
+                                        cellWidthPx * animatedIndex + capsuleInsetPx,
+                                        capsuleInsetPx,
+                                    )
+                                },
                             )
                         } else {
                             Box(
