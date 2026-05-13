@@ -134,7 +134,14 @@ dependencies {
     // Haze: backdrop-blur "liquid glass" library used by the bottom
     // nav bar capsule. Compose-native, GPU-accelerated on API 32+,
     // gracefully degrades to a tinted layer on older devices.
-    implementation("dev.chrisbanes.haze:haze:1.7.2")
+    //
+    // We pin to 1.5.4 because newer (1.6.x +) builds depend on
+    // Compose 1.8 / activity 1.10+ which require compileSdk 35+ and
+    // AGP 8.7+. Sticking to 1.5.4 keeps us compatible with our
+    // existing Compose 1.7.5 / AGP 8.5.2 setup, and 1.5.4 already has
+    // the same hazeSource / hazeEffect / HazeStyle APIs we need for
+    // the capsule.
+    implementation("dev.chrisbanes.haze:haze:1.5.4")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
