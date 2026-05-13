@@ -283,7 +283,13 @@ fun AppRoot(viewModel: MainViewModel) {
     // Hide bottom bar + miniplayer while full-screen player is open.
     val onPlayer = currentRoute == "player"
 
-    val glassOn = LocalSCTheme.current.liquidGlass
+    // The bottom nav capsule uses the Haze-based Liquid Glass lens
+    // whenever the master "Glass surfaces" toggle is on. Previously
+    // we gated this on the separate `liquidGlass` toggle, which led
+    // to users having the master toggle on but `liquidGlass` off and
+    // therefore seeing the plain coloured pill (looked like a "glow")
+    // instead of the refracting lens.
+    val glassOn = LocalSCTheme.current.glassEnabled
 
     // Single app-wide HazeState used by the bottom-nav capsule to
     // backdrop-blur whatever is underneath it (screen content AND
