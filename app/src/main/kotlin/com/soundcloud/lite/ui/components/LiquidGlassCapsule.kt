@@ -79,8 +79,11 @@ fun LiquidGlassCapsule(
         return
     }
 
+    // Haze 1.5.4 throws IllegalArgumentException("backgroundColor not
+    // specified") when drawing with Color.Unspecified. Transparent gives
+    // the same visual result (no opaque backdrop layer) without crashing.
     val style = HazeStyle(
-        backgroundColor = Color.Unspecified,
+        backgroundColor = Color.Transparent,
         tints = listOf(
             HazeTint(tintColor.copy(alpha = tintAlpha)),
         ),
