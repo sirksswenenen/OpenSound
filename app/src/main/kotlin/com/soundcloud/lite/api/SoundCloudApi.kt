@@ -30,7 +30,13 @@ class SoundCloudApi(
     // ── client_id ─────────────────────────────────────────────────────────────
 
     fun clientId(): String? {
-        if (forcedClientId.isNotBlank()) return forcedClientId
+        // User-set value wins immediately. We deliberately *don't* probe
+        // it — if the user typed it in we trust them, and a probe failure
+        // here would hide a perfectly working id behind a network blip.
+        if (forcedClientId.isNotBlank()) {
+            Log.d(TAG, "Using user-supplied client_id from Settings")
+            return forcedClientId
+        }
         cachedClientId.get()?.let { return it }
         for (id in KNOWN_CLIENT_IDS) {
             if (probeClientId(id)) {
@@ -111,9 +117,11 @@ class SoundCloudApi(
     private fun fetchStreamWith(trackId: String, useCache: Boolean): StreamResult? {
         if (!useCache) cachedClientId.set(null)
         val cid = clientId() ?: return null
-        val auth = if (oauthToken.isNotBlank()) "&oauth_token=$oauthToken" else ""
-        val url = "https://api-v2.soundcloud.com/tracks/$trackId/streams?client_id=$cid$auth"
-        val json = httpGetRaw(url, BROWSER_UA) ?: return null
+        // Streams is the only endpoint where the user's OAuth actually
+        // unlocks something (Go+ full-length playback). Pass it via the
+        // Authorization header — which is what the SC web player uses.
+        val url = "https://api-v2.soundcloud.com/tracks/$trackId/streams?client_id=$cid"
+        val json = httpGetAuthed(url, BROWSER_UA) ?: return null
         Log.d(TAG, "streams response for $trackId: ${json.take(200)}")
         val mp3 = extractJsonString(json, "\"http_mp3_128_url\"")
             ?: extractJsonString(json, "\"http_mp3_128\"")
@@ -129,17 +137,24 @@ class SoundCloudApi(
 
     // ── Trending ───────────────────────────────────────────────────────────────
 
+    /**
+     * Top-50 chart. SoundCloud's `/charts` endpoint *requires* a `genre`
+     * parameter — without one the server returns 422. We pass
+     * `soundcloud:genres:all-music` by default which corresponds to the
+     * "All music genres" tab on the SC web player. Callers may override
+     * with a specific genre slug like `pop`, `electronic`, etc.
+     */
     fun getTrending(genre: String? = null, limit: Int = 50): List<TrackInfo> {
         val cid = clientId() ?: run {
             Log.w(TAG, "getTrending: no client_id")
             return emptyList()
         }
-        val genreParam = if (genre != null)
-            "&genre=soundcloud%3Agenres%3A${java.net.URLEncoder.encode(genre, "UTF-8")}" else ""
+        val genreSlug = genre ?: "all-music"
+        val genreParam = "&genre=soundcloud%3Agenres%3A${java.net.URLEncoder.encode(genreSlug, "UTF-8")}"
         val url = "https://api-v2.soundcloud.com/charts?kind=top&limit=$limit$genreParam&client_id=$cid"
         Log.d(TAG, "getTrending: $url")
         val json = httpGetRaw(url, BROWSER_UA) ?: run {
-            Log.w(TAG, "getTrending: null response")
+            Log.w(TAG, "getTrending: null response (network or 4xx)")
             return emptyList()
         }
         Log.d(TAG, "getTrending response: ${json.take(300)}")
@@ -246,12 +261,26 @@ class SoundCloudApi(
 
     // ── HTTP ───────────────────────────────────────────────────────────────────
 
-    fun httpGetRaw(url: String, ua: String): String? = try {
+    /**
+     * Public anonymous GET. Deliberately **does not** attach the user's
+     * OAuth token — if the token is expired SoundCloud returns 401 even
+     * for endpoints that don't require auth (charts, search, public
+     * tracks), which would silently break the whole app. Use
+     * [httpGetAuthed] for endpoints that actually need OAuth (notably
+     * `/streams` for Go+ subscribers).
+     */
+    fun httpGetRaw(url: String, ua: String): String? = httpGet(url, ua, withOAuth = false)
+
+    private fun httpGetAuthed(url: String, ua: String): String? = httpGet(url, ua, withOAuth = true)
+
+    private fun httpGet(url: String, ua: String, withOAuth: Boolean): String? = try {
         val b = Request.Builder().url(url)
             .header("User-Agent", ua)
             .header("Accept", "application/json, text/html, */*")
             .header("Accept-Language", "en-US,en;q=0.9")
-        if (oauthToken.isNotBlank()) b.header("Authorization", "OAuth $oauthToken")
+        if (withOAuth && oauthToken.isNotBlank()) {
+            b.header("Authorization", "OAuth $oauthToken")
+        }
         http.newCall(b.build()).execute().use { r ->
             if (!r.isSuccessful) {
                 Log.w(TAG, "HTTP ${r.code} for $url")

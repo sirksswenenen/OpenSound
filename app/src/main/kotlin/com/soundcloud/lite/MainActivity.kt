@@ -35,6 +35,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.height
@@ -594,23 +595,36 @@ fun AppRoot(viewModel: MainViewModel) {
         containerColor = Color.Transparent,
         bottomBar = {
             if (!onPlayer) {
-                GlassNavigationBar(
-                    tabs = bottomTabs,
-                    currentRoute = currentRoute,
-                    glassOn = glassOn,
-                    onSelect = { route ->
-                        if (currentRoute != route) {
-                            navController.navigate(route) {
-                                popUpTo("home") {
-                                    saveState = true
-                                    inclusive = false
+                // Re-provide the backdrop / blurred-backdrop locals so the
+                // navigation bar's GlassSurface + LiquidGlassCapsule can
+                // sample the captured frame behind them. The Scaffold's
+                // bottomBar slot lives outside the content lambda, so the
+                // providers set up around the content aren't visible here.
+                CompositionLocalProvider(
+                    LocalBackdropLayer provides backdropLayer,
+                    com.soundcloud.lite.ui.components.LocalBackdropOrigin provides backdropOrigin,
+                    LocalTilt provides tilt,
+                    LocalBlurredBackdrop provides blurredBackdrop,
+                    LocalBlurredBackdropScale provides captureScale,
+                ) {
+                    GlassNavigationBar(
+                        tabs = bottomTabs,
+                        currentRoute = currentRoute,
+                        glassOn = glassOn,
+                        onSelect = { route ->
+                            if (currentRoute != route) {
+                                navController.navigate(route) {
+                                    popUpTo("home") {
+                                        saveState = true
+                                        inclusive = false
+                                    }
+                                    launchSingleTop = true
+                                    restoreState = true
                                 }
-                                launchSingleTop = true
-                                restoreState = true
                             }
-                        }
-                    },
-                )
+                        },
+                    )
+                }
             }
         }
     ) { innerPadding ->
@@ -755,6 +769,12 @@ private fun GlassNavigationBar(
             val barContent: @Composable () -> Unit = {
                 Box(modifier = Modifier.fillMaxWidth().height(barHeight)) {
                     // Sliding capsule indicator behind the active icon.
+                    // When Liquid Glass is enabled we use the dedicated
+                    // RuntimeShader capsule so the backdrop refracts as
+                    // the pill slides between tabs (iOS Liquid Glass).
+                    // Otherwise we fall back to the existing GlassSurface
+                    // (or a flat tint when glass is fully off).
+                    val liquidOn = LocalSCTheme.current.liquidGlass
                     Box(
                         modifier = Modifier
                             .padding(vertical = capsuleInset)
@@ -762,20 +782,29 @@ private fun GlassNavigationBar(
                             .width(capsuleWidth)
                             .fillMaxHeight(),
                     ) {
-                        if (glassOn) {
-                            com.soundcloud.lite.ui.components.GlassSurface(
-                                modifier = Modifier.fillMaxSize(),
-                                shape = capsuleShape,
-                            ) { }
-                        } else {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .background(
-                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
-                                        shape = capsuleShape,
-                                    ),
-                            )
+                        when {
+                            liquidOn && glassOn -> {
+                                com.soundcloud.lite.ui.components.LiquidGlassCapsule(
+                                    modifier = Modifier.fillMaxSize(),
+                                    shape = capsuleShape,
+                                )
+                            }
+                            glassOn -> {
+                                com.soundcloud.lite.ui.components.GlassSurface(
+                                    modifier = Modifier.fillMaxSize(),
+                                    shape = capsuleShape,
+                                ) { }
+                            }
+                            else -> {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(
+                                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
+                                            shape = capsuleShape,
+                                        ),
+                                )
+                            }
                         }
                     }
 
@@ -785,11 +814,19 @@ private fun GlassNavigationBar(
                             val color =
                                 if (selected) MaterialTheme.colorScheme.primary
                                 else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
+                            // No ripple / no Material indication — the moving
+                            // glass capsule already communicates selection. A
+                            // ripple on top of the capsule looks like two
+                            // separate effects stacked.
+                            val noRippleInteraction = remember { MutableInteractionSource() }
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
                                     .fillMaxHeight()
-                                    .clickable { onSelect(tab.route) },
+                                    .clickable(
+                                        interactionSource = noRippleInteraction,
+                                        indication = null,
+                                    ) { onSelect(tab.route) },
                                 contentAlignment = Alignment.Center,
                             ) {
                                 Column(

@@ -166,6 +166,17 @@ fun SettingsScreen(viewModel: MainViewModel) {
                     onChange = { v -> viewModel.updateSettings { it.copy(glassReflection = v) } }
                 )
                 GlassSliderRow(
+                    label = "Highlight intensity",
+                    value = settings.glassHighlight,
+                    onChange = { v -> viewModel.updateSettings { it.copy(glassHighlight = v) } }
+                )
+                Text(
+                    "0 = no rim highlights (clean blurred glass). Higher = brighter top + bottom edge strips.",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
+                )
+                GlassSliderRow(
                     label = "Corner radius",
                     value = settings.glassRadius / 40f,
                     displayValue = "${settings.glassRadius.toInt()} dp",
