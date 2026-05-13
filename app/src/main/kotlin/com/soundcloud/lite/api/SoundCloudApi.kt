@@ -310,6 +310,16 @@ class SoundCloudApi(
 
     // ── JSON parsing ───────────────────────────────────────────────────────────
 
+    /**
+     * Parses SC's `collection: [...]` (or bare top-level array) of track
+     * entries.
+     *
+     * **Deduplicates by `providerId`**: `/charts?kind=trending` will
+     * occasionally include the same track in multiple chart positions,
+     * and `/search/tracks` can echo a track that's also surfaced via
+     * `relatedTo`. The downstream `LazyColumn` keys items by id and
+     * crashes on duplicates, so we drop them here.
+     */
     private fun parseCollection(json: String): List<TrackInfo> {
         val trimmed = json.trimStart()
         val arrStart = if (trimmed.startsWith('[')) {
@@ -326,14 +336,30 @@ class SoundCloudApi(
         val arrJson = extractJsonArray(json, arrStart) ?: return emptyList()
         val objects = splitJsonObjects(arrJson)
         Log.d(TAG, "parseCollection: ${objects.size} objects")
-        return objects.mapNotNull { parseTrack(it) }
+        return objects.mapNotNull { parseTrack(it) }.dedupById()
     }
 
     private fun parseTrackArray(json: String): List<TrackInfo> {
         val start = json.indexOf('[')
         if (start < 0) return emptyList()
         val arr = extractJsonArray(json, start) ?: return emptyList()
-        return splitJsonObjects(arr).mapNotNull { parseTrack(it) }
+        return splitJsonObjects(arr).mapNotNull { parseTrack(it) }.dedupById()
+    }
+
+    /**
+     * Drop duplicates from the SC response. `/charts` returns the same
+     * track multiple times for repeated chart positions, which crashes
+     * LazyColumn's stable-key contract downstream.
+     */
+    private fun List<TrackInfo>.dedupById(): List<TrackInfo> {
+        if (size <= 1) return this
+        val seen = HashSet<String>(size)
+        val out = ArrayList<TrackInfo>(size)
+        for (t in this) {
+            val key = t.providerId.ifBlank { t.id }
+            if (seen.add(key)) out.add(t)
+        }
+        return out
     }
 
     private fun parseTrack(obj: String): TrackInfo? {

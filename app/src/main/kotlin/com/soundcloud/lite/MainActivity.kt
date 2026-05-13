@@ -777,14 +777,65 @@ private fun GlassNavigationBar(
             val barHeight = 64.dp
 
             val barContent: @Composable () -> Unit = {
+                // The bar is rendered in three z-stacked layers so that
+                // the Liquid Glass capsule actually behaves like a lens
+                // moving across the icons (the iPhone-style effect):
+                //
+                //   1. Icons row, marked as `hazeSource`. Drawn first so
+                //      it's "behind" the capsule. Inside this row we
+                //      DO NOT attach click handlers — those go on layer
+                //      3, so the capsule visually covers the icons but
+                //      taps still pass through.
+                //   2. The sliding capsule (`hazeEffect`). Drawn on top
+                //      of the icons. Where it overlaps an icon, the
+                //      icon is rendered blurred / tinted through the
+                //      lens; outside the capsule the icons stay crisp.
+                //   3. A transparent row of click hit-boxes on top of
+                //      everything. Forwards taps to `onSelect`.
                 Box(modifier = Modifier.fillMaxWidth().height(barHeight)) {
-                    // Sliding capsule indicator behind the active icon.
-                    // When Liquid Glass is enabled we use the dedicated
-                    // RuntimeShader capsule so the backdrop refracts as
-                    // the pill slides between tabs (iOS Liquid Glass).
-                    // Otherwise we fall back to the existing GlassSurface
-                    // (or a flat tint when glass is fully off).
                     val liquidOn = LocalSCTheme.current.liquidGlass
+
+                    // ── layer 1: visual icons (haze source) ──────────
+                    Row(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .hazeSource(
+                                state = LocalHazeState.current ?: HazeState(),
+                            ),
+                    ) {
+                        tabs.forEach { tab ->
+                            val selected = currentRoute == tab.route
+                            val color =
+                                if (selected) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight(),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                ) {
+                                    Icon(
+                                        imageVector = tab.icon,
+                                        contentDescription = tab.label,
+                                        tint = color,
+                                        modifier = Modifier.size(22.dp),
+                                    )
+                                    Text(
+                                        text = tab.label,
+                                        color = color,
+                                        fontSize = 11.sp,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // ── layer 2: capsule (haze effect, the lens) ─────
                     Box(
                         modifier = Modifier
                             .padding(vertical = capsuleInset)
@@ -818,27 +869,9 @@ private fun GlassNavigationBar(
                         }
                     }
 
-                    // Mark the icons row as a Haze source too — this is
-                    // what makes the icons themselves visibly distort /
-                    // refract as the capsule glides across them. Without
-                    // this the capsule only blurs the *screen content*
-                    // above the bar, and the icons stay crisp.
-                    Row(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .hazeSource(
-                                state = LocalHazeState.current ?: HazeState(),
-                            ),
-                    ) {
+                    // ── layer 3: invisible click hit-boxes ───────────
+                    Row(modifier = Modifier.fillMaxSize()) {
                         tabs.forEach { tab ->
-                            val selected = currentRoute == tab.route
-                            val color =
-                                if (selected) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
-                            // No ripple / no Material indication — the moving
-                            // glass capsule already communicates selection. A
-                            // ripple on top of the capsule looks like two
-                            // separate effects stacked.
                             val noRippleInteraction = remember { MutableInteractionSource() }
                             Box(
                                 modifier = Modifier
@@ -848,26 +881,7 @@ private fun GlassNavigationBar(
                                         interactionSource = noRippleInteraction,
                                         indication = null,
                                     ) { onSelect(tab.route) },
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Column(
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                ) {
-                                    Icon(
-                                        imageVector = tab.icon,
-                                        contentDescription = tab.label,
-                                        tint = color,
-                                        modifier = Modifier.size(22.dp),
-                                    )
-                                    Text(
-                                        text = tab.label,
-                                        color = color,
-                                        fontSize = 11.sp,
-                                        maxLines = 1,
-                                        softWrap = false,
-                                    )
-                                }
-                            }
+                            )
                         }
                     }
                 }

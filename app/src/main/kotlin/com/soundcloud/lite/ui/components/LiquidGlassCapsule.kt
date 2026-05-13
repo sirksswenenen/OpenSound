@@ -64,10 +64,15 @@ fun LiquidGlassCapsule(
     val effectiveHighlight = (highlight * theme.glassHighlight).coerceIn(0f, 1f)
     // Driven directly by user's Settings → Glass surfaces → Blur slider.
     val blurAmount = theme.glassBlur.coerceIn(0f, 1f)
-    // Blur radius scales from 4 dp (subtle, "the pill is barely a lens")
-    // to 28 dp (fully iOS-Liquid-Glass "everything mushed into frosted").
-    val blurRadiusDp = (4f + 24f * blurAmount)
-    val tintAlpha = (0.10f + 0.18f * blurAmount).coerceIn(0f, 1f)
+    // Blur radius scales from 6 dp (subtle, "barely a lens") to 40 dp
+    // (fully iOS-Liquid-Glass, everything underneath mushed into a
+    // frosted bead). The lower bound is deliberately above zero so the
+    // pill is always clearly a lens, never just a flat tint — that
+    // matches iOS where the pill is *always* refracting.
+    val blurRadiusDp = (6f + 34f * blurAmount)
+    // Tint is intentionally light so the lens effect (refracted icons,
+    // refracted screen content) reads through.
+    val tintAlpha = (0.06f + 0.12f * blurAmount).coerceIn(0f, 1f)
 
     if (hazeState == null) {
         // Defensive fallback: tinted plain box. Shouldn't be hit in app.
