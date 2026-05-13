@@ -145,6 +145,7 @@ private fun LiquidGlassCapsuleApi33(
 ) {
     val blurredBackdrop = LocalBlurredBackdrop.current
     val backdropScale = LocalBlurredBackdropScale.current
+    val backdropOrigin = LocalBackdropOrigin.current
     val theme = LocalSCTheme.current
     var panelPos by remember { mutableStateOf(Offset.Zero) }
     var panelSize by remember { mutableStateOf(IntSize.Zero) }
@@ -182,17 +183,28 @@ private fun LiquidGlassCapsuleApi33(
                             AndroidShader.TileMode.CLAMP,
                             AndroidShader.TileMode.CLAMP,
                         )
-                        val ox = panelPos.x * backdropScale
-                        val oy = panelPos.y * backdropScale
+                        // The captured backdrop bitmap covers the
+                        // recorded area which starts at backdropOrigin
+                        // in root coords (typically just below the
+                        // status bar), and was scaled down by
+                        // backdropScale. We want the slice that sits
+                        // BEHIND this panel — so subtract the origin
+                        // from the panel's root position before
+                        // scaling into bitmap space.
+                        val relX = panelPos.x - backdropOrigin.x
+                        val relY = panelPos.y - backdropOrigin.y
                         val m = Matrix().apply {
-                            // Scale from bitmap-space to panel-space, then
-                            // translate so the slice that lies behind the
-                            // panel ends up at (0, 0).
-                            postTranslate(-ox, -oy)
+                            // First scale panel-space (px) UP by
+                            // 1 / backdropScale so that 1 px in the
+                            // bitmap maps to 1 / scale px on the panel.
                             postScale(
                                 1f / backdropScale,
                                 1f / backdropScale,
                             )
+                            // Then translate the bitmap so the pixel
+                            // that lives at (relX, relY) in panel
+                            // root-space lands at (0, 0) of the panel.
+                            postTranslate(-relX, -relY)
                         }
                         bmpShader.setLocalMatrix(m)
                         shader.setInputShader("backdrop", bmpShader)
