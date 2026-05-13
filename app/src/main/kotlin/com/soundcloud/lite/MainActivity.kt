@@ -393,23 +393,19 @@ fun AppRoot(viewModel: MainViewModel) {
             val refr = refractionAmountState.value
             val quality = glassQualityState.value
             val gpu = useGpuEffectsState.value
-            if (gpu) {
-                // GPU effects path handles blur + refraction directly
-                // via Modifier.blur in GlassSurface. The worker has
-                // nothing to publish.
-                if (blurredBackdrop != null) blurredBackdrop = null
-                delay(120L)
-                continue
-            }
-            // Refraction also requires a captured bitmap (we sample a
-            // smaller central region of it), so it triggers capture
-            // on its own — even when blur and chroma are both zero.
-            val needsCapture = amt >= 0.02f || chr >= 0.02f || refr >= 0.02f
-            if (!needsCapture) {
-                if (blurredBackdrop != null) blurredBackdrop = null
-                delay(60L)
-                continue
-            }
+            // Note: in GPU-effects mode GlassSurface does its own
+            // blur via Modifier.blur on the layer, so the heavy
+            // StackBlur work below isn't needed for the bar. But
+            // LiquidGlassCapsule (the active-tab pill) ALWAYS needs
+            // a sampled bitmap of the backdrop to feed into its
+            // RuntimeShader — so we keep capturing here at low cost
+            // (downsample only, no StackBlur) even in GPU mode.
+            val gpuOnly = gpu
+            // We always capture when liquidGlass is on: even with all
+            // sliders at 0 the LiquidGlassCapsule (active-tab pill)
+            // needs a sampled backdrop bitmap for its RuntimeShader.
+            // Refraction also requires a captured bitmap on its own.
+            val needsCapture = true
             // Frame skip at Low quality: publish every Nth display
             // frame instead of every one. Cuts the worker's CPU
             // budget proportionally and is barely visible because
@@ -423,7 +419,10 @@ fun AppRoot(viewModel: MainViewModel) {
             // the same VISUAL blur. We also cap by the current
             // quality preset so Low never spends more than ~r=36 ms.
             val targetCaptureScale = quality.captureScale
-            val radius = if (amt >= 0.02f) {
+            // In GPU mode the GlassSurface bar handles its own blur,
+            // so we publish a clean (un-blurred) downsample for the
+            // capsule. Otherwise apply StackBlur sized by the slider.
+            val radius = if (!gpuOnly && amt >= 0.02f) {
                 val scaled = (amt * 40f * (targetCaptureScale / 0.22f))
                 scaled.toInt().coerceIn(1, quality.maxRadius)
             } else 0

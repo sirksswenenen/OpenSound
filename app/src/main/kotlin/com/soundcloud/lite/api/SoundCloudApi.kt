@@ -24,24 +24,77 @@ class SoundCloudApi(
     private val http: OkHttpClient = defaultHttp(),
 ) {
     private val cachedClientId = AtomicReference<String?>(null)
+    /**
+     * Set of `forcedClientId` values we've already proved don't work.
+     * The user can keep a bad value in Settings without us re-probing
+     * (and re-failing) it on every API call. Cleared when the user
+     * changes the Settings value to something different.
+     */
+    private val deadForcedIds = mutableSetOf<String>()
+    @Volatile private var lastForcedSeen: String = ""
     var oauthToken: String = ""
+    /**
+     * Setting this to a non-blank string makes [clientId] **try** that id
+     * first. If it works it's cached and used for everything; if it
+     * doesn't (typo, revoked id, etc.) we fall back to the bundled known
+     * list + a fresh scrape, exactly as if the user hadn't supplied
+     * anything. We never silently keep using a bad user id — that's how
+     * the old build wedged itself when the user typed a typo and got
+     * "trends don't load" with no recourse.
+     */
     var forcedClientId: String = ""
+
+    /**
+     * The id we're currently using (after [clientId] picks one). Read by
+     * the UI to show the user which id is actually in effect, since
+     * forcedClientId may be ignored if it failed its probe.
+     */
+    @Volatile var activeClientId: String? = null
+        private set
+
+    /** Last user-visible error from a request, or null. */
+    @Volatile var lastError: String? = null
+        private set
 
     // ── client_id ─────────────────────────────────────────────────────────────
 
     fun clientId(): String? {
-        // User-set value wins immediately. We deliberately *don't* probe
-        // it — if the user typed it in we trust them, and a probe failure
-        // here would hide a perfectly working id behind a network blip.
-        if (forcedClientId.isNotBlank()) {
-            Log.d(TAG, "Using user-supplied client_id from Settings")
-            return forcedClientId
+        // Drop the "this forced id is dead" memo if the user has since
+        // changed the value (e.g. fixed a typo in Settings).
+        if (forcedClientId != lastForcedSeen) {
+            deadForcedIds.removeAll { it == lastForcedSeen }
+            cachedClientId.set(null)
+            lastForcedSeen = forcedClientId
         }
-        cachedClientId.get()?.let { return it }
+        // 1. User-supplied id from Settings — probe once, cache result.
+        //    If it works we use it; if not we fall through to the bundled
+        //    list. We DON'T just trust the user blindly: a bad user id
+        //    would otherwise poison every request silently.
+        val forced = forcedClientId
+        if (forced.isNotBlank() && forced !in deadForcedIds) {
+            cachedClientId.get()?.let { cached ->
+                if (cached == forced) return cached
+            }
+            if (probeClientId(forced)) {
+                Log.d(TAG, "Using user-supplied client_id from Settings")
+                cachedClientId.set(forced)
+                activeClientId = forced
+                lastError = null
+                return forced
+            }
+            Log.w(TAG, "User-supplied client_id failed its probe — falling back to defaults")
+            deadForcedIds.add(forced)
+            lastError = "Your Settings client_id was rejected by SoundCloud — using the built-in fallback id instead."
+        }
+        cachedClientId.get()?.let {
+            activeClientId = it
+            return it
+        }
         for (id in KNOWN_CLIENT_IDS) {
             if (probeClientId(id)) {
                 Log.d(TAG, "Using known client_id: $id")
                 cachedClientId.set(id)
+                activeClientId = id
                 return id
             }
         }
@@ -49,9 +102,12 @@ class SoundCloudApi(
         if (scraped != null) {
             Log.d(TAG, "Scraped client_id: $scraped")
             cachedClientId.set(scraped)
+            activeClientId = scraped
             return scraped
         }
         Log.w(TAG, "Could not obtain client_id")
+        lastError = "Couldn't obtain a SoundCloud client_id — check internet connectivity."
+        activeClientId = null
         return null
     }
 
