@@ -81,6 +81,9 @@ import com.soundcloud.lite.ui.screens.SearchScreen
 import com.soundcloud.lite.ui.screens.SettingsScreen
 import com.soundcloud.lite.ui.components.BackdropHost
 import com.soundcloud.lite.ui.components.LocalBackdropLayer
+import com.soundcloud.lite.ui.components.LocalHazeState
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
 import com.soundcloud.lite.ui.components.LocalBlurredBackdrop
 import com.soundcloud.lite.ui.components.LocalBlurredBackdropScale
 import com.soundcloud.lite.ui.components.LocalTilt
@@ -281,6 +284,11 @@ fun AppRoot(viewModel: MainViewModel) {
     val onPlayer = currentRoute == "player"
 
     val glassOn = LocalSCTheme.current.liquidGlass
+
+    // Single app-wide HazeState used by the bottom-nav capsule to
+    // backdrop-blur whatever is underneath it (screen content AND
+    // the row of nav icons). See LiquidGlassCapsule docs.
+    val hazeState = androidx.compose.runtime.remember { HazeState() }
 
     // GraphicsLayer capturing the list/AppNavHost content so the
     // MiniPlayer overlay can sample it for backdrop blur. Only
@@ -605,6 +613,7 @@ fun AppRoot(viewModel: MainViewModel) {
                     LocalTilt provides tilt,
                     LocalBlurredBackdrop provides blurredBackdrop,
                     LocalBlurredBackdropScale provides captureScale,
+                    LocalHazeState provides hazeState,
                 ) {
                     GlassNavigationBar(
                         tabs = bottomTabs,
@@ -688,7 +697,9 @@ fun AppRoot(viewModel: MainViewModel) {
                         .matchParentSize()
                         .background(bgBrush)
                 )
-                AppNavHost(navController = navController, viewModel = viewModel)
+                Box(modifier = Modifier.fillMaxSize().hazeSource(state = hazeState)) {
+                    AppNavHost(navController = navController, viewModel = viewModel)
+                }
             }
 
             // MiniPlayer overlay — sits at the bottom of the content
@@ -807,7 +818,18 @@ private fun GlassNavigationBar(
                         }
                     }
 
-                    Row(modifier = Modifier.fillMaxSize()) {
+                    // Mark the icons row as a Haze source too — this is
+                    // what makes the icons themselves visibly distort /
+                    // refract as the capsule glides across them. Without
+                    // this the capsule only blurs the *screen content*
+                    // above the bar, and the icons stay crisp.
+                    Row(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .hazeSource(
+                                state = LocalHazeState.current ?: HazeState(),
+                            ),
+                    ) {
                         tabs.forEach { tab ->
                             val selected = currentRoute == tab.route
                             val color =

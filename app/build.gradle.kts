@@ -12,8 +12,8 @@ android {
         applicationId = "com.soundcloud.lite"
         minSdk = 24
         targetSdk = 34
-        versionCode = 9
-        versionName = "0.5.2"
+        versionCode = 10
+        versionName = "0.5.3"
     }
 
     signingConfigs {
@@ -130,6 +130,11 @@ dependencies {
 
     // Coil for artwork
     implementation("io.coil-kt:coil-compose:2.6.0")
+
+    // Haze: backdrop-blur "liquid glass" library used by the bottom
+    // nav bar capsule. Compose-native, GPU-accelerated on API 32+,
+    // gracefully degrades to a tinted layer on older devices.
+    implementation("dev.chrisbanes.haze:haze:1.7.2")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
