@@ -51,6 +51,13 @@ val LocalHazeState = compositionLocalOf<HazeState?> { null }
 fun LiquidGlassCapsule(
     modifier: Modifier = Modifier,
     shape: Shape,
+    /**
+     * Override for the HazeState the capsule should use as its lens
+     * source. When null, falls back to [LocalHazeState]. Callers that
+     * also drive sibling `hazeSource` modifiers should pass the SAME
+     * instance here to guarantee both ends share state.
+     */
+    hazeStateOverride: dev.chrisbanes.haze.HazeState? = null,
     /** 0..1 — extra brightness on the top edge for a "lit" glass look.
      *  Multiplied by the global `glassHighlight` slider. */
     highlight: Float = 1.0f,
@@ -59,7 +66,7 @@ fun LiquidGlassCapsule(
     tintColor: Color = Color.White.copy(alpha = 0.18f),
 ) {
     val theme = LocalSCTheme.current
-    val hazeState = LocalHazeState.current
+    val hazeState = hazeStateOverride ?: LocalHazeState.current
 
     val effectiveHighlight = (highlight * theme.glassHighlight).coerceIn(0f, 1f)
     // Driven directly by user's Settings → Glass surfaces → Blur slider.

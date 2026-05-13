@@ -128,7 +128,7 @@ data class AppSettings(
      * edges via an AGSL [android.graphics.RuntimeShader]. Requires Android 13
      * (API 33) — on older versions the toggle is a no-op.
      */
-    val liquidGlass: Boolean = false,
+    val liquidGlass: Boolean = true,
     /** Blur strength for Liquid Glass backdrop sampling (0..1). */
     val glassBlur: Float = 0.55f,
     /** Tint alpha scale for Liquid Glass (0..1, mapped internally to 0..0.5). */
@@ -194,7 +194,7 @@ class SettingsRepository(context: Context) {
         themePreset = enumSafe<ThemePreset>(prefs.getString("theme", null)) ?: ThemePreset.OrangeNight,
         glassEnabled = prefs.getBoolean("glass_enabled", true),
         glassDark = prefs.getBoolean("glass_dark", true),
-        liquidGlass = prefs.getBoolean("liquid_glass", false),
+        liquidGlass = prefs.getBoolean("liquid_glass", true),
         glassBlur = prefs.getFloat("glass_blur", 0.55f),
         glassTint = prefs.getFloat("glass_tint", 0.30f),
         glassReflection = prefs.getFloat("glass_reflection", 0.55f),

@@ -793,15 +793,24 @@ private fun GlassNavigationBar(
                 //   3. A transparent row of click hit-boxes on top of
                 //      everything. Forwards taps to `onSelect`.
                 Box(modifier = Modifier.fillMaxWidth().height(barHeight)) {
-                    val liquidOn = LocalSCTheme.current.liquidGlass
+                    // Resolve the app-wide HazeState exactly ONCE here.
+                    // We pass the SAME instance to both the icons row's
+                    // hazeSource and the capsule's hazeEffect so they
+                    // share state. Earlier versions accidentally created
+                    // a fresh HazeState as a per-recomposition fallback,
+                    // which silently broke the lens (effect couldn't see
+                    // the icons because they were registered in a
+                    // different HazeState instance).
+                    val providedHaze = LocalHazeState.current
+                    val sharedHaze = remember(providedHaze) {
+                        providedHaze ?: HazeState()
+                    }
 
                     // ── layer 1: visual icons (haze source) ──────────
                     Row(
                         modifier = Modifier
                             .fillMaxSize()
-                            .hazeSource(
-                                state = LocalHazeState.current ?: HazeState(),
-                            ),
+                            .hazeSource(state = sharedHaze),
                     ) {
                         tabs.forEach { tab ->
                             val selected = currentRoute == tab.route
@@ -836,6 +845,11 @@ private fun GlassNavigationBar(
                     }
 
                     // ── layer 2: capsule (haze effect, the lens) ─────
+                    // We always use LiquidGlassCapsule (Haze-based)
+                    // whenever glass surfaces are enabled — the separate
+                    // `liquidGlass` toggle was redundant and only made
+                    // it possible to silently end up on the old
+                    // GlassSurface code path that doesn't refract icons.
                     Box(
                         modifier = Modifier
                             .padding(vertical = capsuleInset)
@@ -843,29 +857,21 @@ private fun GlassNavigationBar(
                             .width(capsuleWidth)
                             .fillMaxHeight(),
                     ) {
-                        when {
-                            liquidOn && glassOn -> {
-                                com.soundcloud.lite.ui.components.LiquidGlassCapsule(
-                                    modifier = Modifier.fillMaxSize(),
-                                    shape = capsuleShape,
-                                )
-                            }
-                            glassOn -> {
-                                com.soundcloud.lite.ui.components.GlassSurface(
-                                    modifier = Modifier.fillMaxSize(),
-                                    shape = capsuleShape,
-                                ) { }
-                            }
-                            else -> {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .background(
-                                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
-                                            shape = capsuleShape,
-                                        ),
-                                )
-                            }
+                        if (glassOn) {
+                            com.soundcloud.lite.ui.components.LiquidGlassCapsule(
+                                modifier = Modifier.fillMaxSize(),
+                                shape = capsuleShape,
+                                hazeStateOverride = sharedHaze,
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(
+                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
+                                        shape = capsuleShape,
+                                    ),
+                            )
                         }
                     }
 
