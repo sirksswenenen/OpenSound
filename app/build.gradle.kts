@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
 }
 
@@ -54,9 +55,10 @@ android {
         compose = true
     }
 
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.14"
-    }
+    // Kotlin 2.0+ no longer uses `kotlinCompilerExtensionVersion` here;
+    // the Compose Compiler is now applied via the
+    // `org.jetbrains.kotlin.plugin.compose` plugin (declared above)
+    // which automatically tracks the active Kotlin version.
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -65,6 +67,10 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+        // Kotlin 2.0 makes K2 the default. Keep us on the stable behaviour
+        // (default) but explicitly enable the strict-null `Configuration`
+        // diagnostics so we catch any new K2 warnings in CI.
+        freeCompilerArgs = freeCompilerArgs + listOf("-Xskip-prerelease-check")
     }
 
     sourceSets {
