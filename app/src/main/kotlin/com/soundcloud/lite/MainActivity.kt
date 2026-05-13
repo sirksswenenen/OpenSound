@@ -31,12 +31,24 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.width
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -582,54 +594,23 @@ fun AppRoot(viewModel: MainViewModel) {
         containerColor = Color.Transparent,
         bottomBar = {
             if (!onPlayer) {
-                CompositionLocalProvider(
-                    com.soundcloud.lite.ui.components.LocalSafeForGlass provides false
-                ) {
-                    NavigationBar(
-                        containerColor = if (glassOn)
-                            MaterialTheme.colorScheme.surface.copy(alpha = 0.55f)
-                        else
-                            MaterialTheme.colorScheme.surface,
-                        tonalElevation = 0.dp
-                    ) {
-                        bottomTabs.forEach { tab ->
-                            val selected = currentRoute == tab.route
-                            NavigationBarItem(
-                                selected = selected,
-                                onClick = {
-                                    if (!selected) {
-                                        navController.navigate(tab.route) {
-                                            popUpTo("home") {
-                                                saveState = true
-                                                inclusive = false
-                                            }
-                                            launchSingleTop = true
-                                            restoreState = true
-                                        }
-                                    }
-                                },
-                                icon = { Icon(tab.icon, contentDescription = tab.label, modifier = Modifier.size(22.dp)) },
-                                label = {
-                                    Text(
-                                        tab.label,
-                                        fontSize = 11.sp,
-                                        maxLines = 1,
-                                        softWrap = false,
-                                        overflow = androidx.compose.ui.text.style.TextOverflow.Visible
-                                    )
-                                },
-                                alwaysShowLabel = true,
-                                colors = NavigationBarItemDefaults.colors(
-                                    selectedIconColor = MaterialTheme.colorScheme.primary,
-                                    selectedTextColor = MaterialTheme.colorScheme.primary,
-                                    unselectedIconColor = MaterialTheme.colorScheme.onSurface,
-                                    unselectedTextColor = MaterialTheme.colorScheme.onSurface,
-                                    indicatorColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
-                                )
-                            )
+                GlassNavigationBar(
+                    tabs = bottomTabs,
+                    currentRoute = currentRoute,
+                    glassOn = glassOn,
+                    onSelect = { route ->
+                        if (currentRoute != route) {
+                            navController.navigate(route) {
+                                popUpTo("home") {
+                                    saveState = true
+                                    inclusive = false
+                                }
+                                launchSingleTop = true
+                                restoreState = true
+                            }
                         }
-                    }
-                } // end CompositionLocalProvider(LocalSafeForGlass)
+                    },
+                )
             }
         }
     ) { innerPadding ->
@@ -727,25 +708,126 @@ fun AppRoot(viewModel: MainViewModel) {
         }
     }
 
-    // Universal alternative-source picker overlay. Hosted at the AppRoot
-    // level so it can pop up over any tab/screen the user happens to be
-    // on when they long-press a track.
-    val altState by viewModel.altSourceState.collectAsState()
-    val playlists by viewModel.playlists.collectAsState()
-    altState?.let { st ->
-        com.soundcloud.lite.ui.components.AlternativeSourceDialog(
-            state = st,
-            playlists = playlists,
-            onDismiss = { viewModel.closeAlternativeSources() },
-            onPlay = { alt -> viewModel.playAlternative(st.originalTrack, alt) },
-            onReplaceInCurrent = { alt ->
-                val pid = st.currentPlaylistId
-                if (pid != null) {
-                    viewModel.replaceWithAlternative(pid, st.originalTrack.id, alt)
+}
+
+/**
+ * Glassmorphic bottom navigation. Renders a single `GlassSurface` strip across
+ * the bottom of the screen and slides a translucent capsule (also glass) under
+ * the active icon as tabs switch. Adapts to the user's glass settings — when
+ * the glass effect is disabled we fall back to a flat, themed surface so the
+ * bar still looks intentional on weaker GPUs / OLED-saver setups.
+ */
+@Composable
+private fun GlassNavigationBar(
+    tabs: List<BottomTab>,
+    currentRoute: String?,
+    glassOn: Boolean,
+    onSelect: (String) -> Unit,
+) {
+    val selectedIndex = tabs.indexOfFirst { it.route == currentRoute }.coerceAtLeast(0)
+    val animatedIndex by animateFloatAsState(
+        targetValue = selectedIndex.toFloat(),
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessLow,
+        ),
+        label = "navIndicator",
+    )
+
+    val barShape = RoundedCornerShape(28.dp)
+    val capsuleShape = RoundedCornerShape(24.dp)
+
+    CompositionLocalProvider(
+        com.soundcloud.lite.ui.components.LocalSafeForGlass provides false,
+    ) {
+        androidx.compose.foundation.layout.BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxWidth()
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+        ) {
+            val barWidth = maxWidth
+            val cellWidth = barWidth / tabs.size.coerceAtLeast(1)
+            val capsuleInset = 6.dp
+            val capsuleWidth = cellWidth - capsuleInset * 2
+            val barHeight = 64.dp
+
+            val barContent: @Composable () -> Unit = {
+                Box(modifier = Modifier.fillMaxWidth().height(barHeight)) {
+                    // Sliding capsule indicator behind the active icon.
+                    Box(
+                        modifier = Modifier
+                            .padding(vertical = capsuleInset)
+                            .offset(x = cellWidth * animatedIndex + capsuleInset)
+                            .width(capsuleWidth)
+                            .fillMaxHeight(),
+                    ) {
+                        if (glassOn) {
+                            com.soundcloud.lite.ui.components.GlassSurface(
+                                modifier = Modifier.fillMaxSize(),
+                                shape = capsuleShape,
+                            ) { }
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(
+                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
+                                        shape = capsuleShape,
+                                    ),
+                            )
+                        }
+                    }
+
+                    Row(modifier = Modifier.fillMaxSize()) {
+                        tabs.forEach { tab ->
+                            val selected = currentRoute == tab.route
+                            val color =
+                                if (selected) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight()
+                                    .clickable { onSelect(tab.route) },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                ) {
+                                    Icon(
+                                        imageVector = tab.icon,
+                                        contentDescription = tab.label,
+                                        tint = color,
+                                        modifier = Modifier.size(22.dp),
+                                    )
+                                    Text(
+                                        text = tab.label,
+                                        color = color,
+                                        fontSize = 11.sp,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
-            },
-            onAddToPlaylist = { pid, alt -> viewModel.addAlternativeToPlaylist(pid, alt) }
-        )
+            }
+
+            if (glassOn) {
+                com.soundcloud.lite.ui.components.GlassSurface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = barShape,
+                ) { barContent() }
+            } else {
+                Surface(
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+                    shape = barShape,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { barContent() }
+            }
+        }
     }
 }
 

@@ -1,13 +1,20 @@
 package com.soundcloud.lite.api
 
 /**
- * Where a [TrackInfo] originated. Determines which API client to call
- * to resolve a playable stream URL at play time, and which badge to
- * show on the track row in the UI.
+ * Where a [TrackInfo] originated. As of v0.5.0 OpenSound is SoundCloud-only,
+ * so every newly-created track is [SOUNDCLOUD]. The other values are kept
+ * solely to deserialize playlists persisted by earlier versions without
+ * crashing; tracks of those types are filtered out at load time.
  */
 enum class Provider(val display: String) {
-    AUDIUS("Audius"),
-    YOUTUBE("YouTube"),
     SOUNDCLOUD("SoundCloud"),
+
+    /** Legacy: previously imported via Audius. Treated as unplayable. */
+    AUDIUS("Audius (legacy)"),
+
+    /** Legacy: previously imported via Invidious/YouTube. Treated as unplayable. */
+    YOUTUBE("YouTube (legacy)"),
+
+    /** Fallback for unknown / corrupt persisted values. */
     UNKNOWN("Unknown"),
 }

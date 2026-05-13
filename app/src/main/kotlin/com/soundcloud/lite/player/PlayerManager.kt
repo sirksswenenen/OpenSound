@@ -10,14 +10,14 @@ import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
-import com.soundcloud.lite.api.AudiusApi
 import com.soundcloud.lite.api.Provider
+import com.soundcloud.lite.api.SoundCloudApi
 import com.soundcloud.lite.api.TrackInfo
-import com.soundcloud.lite.api.YouTubeApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -34,32 +34,33 @@ import kotlinx.coroutines.launch
  */
 class PlayerManager(
     private val context: Context,
-    private val audius: AudiusApi,
-    private val youtube: YouTubeApi,
-    private val soundCloud: com.soundcloud.lite.api.SoundCloudApi,
+    private val soundCloud: SoundCloudApi,
 ) {
-
-    fun resolveStreamUrlPublic(track: TrackInfo): String? = resolveStreamUrl(track)
 
     /** Injected by MainActivity/ViewModel after construction. */
     var downloadRepo: com.soundcloud.lite.data.DownloadRepository? = null
 
-    private fun resolveStreamUrl(track: TrackInfo): String? {
-        // Prefer local file if available
-        downloadRepo?.getLocalPath(track.id)?.let { return "file://$it" }
-        val url = when (track.provider) {
-            Provider.AUDIUS -> if (track.providerId.isNotBlank()) audius.streamUrl(track.providerId) else null
-            Provider.YOUTUBE -> if (track.providerId.isNotBlank()) youtube.streamUrl(track.providerId) else null
-            Provider.SOUNDCLOUD -> if (track.providerId.isNotBlank())
-                soundCloud.getStreamUrl(
-                    trackId = track.providerId,
-                    trackPermalink = track.permalink,
-                )?.url else null
-            Provider.UNKNOWN -> null
+    private suspend fun resolveStreamUrl(track: TrackInfo): String? =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            downloadRepo?.getLocalPath(track.id)?.let { return@withContext "file://$it" }
+            if (track.provider != Provider.SOUNDCLOUD) {
+                android.util.Log.w(
+                    "PlayerManager",
+                    "Skipping legacy ${track.provider} track ${track.title}"
+                )
+                return@withContext null
+            }
+            if (track.providerId.isBlank()) {
+                android.util.Log.w("PlayerManager", "Track ${track.title} has blank providerId")
+                return@withContext null
+            }
+            val res = soundCloud.getStreamUrl(track.providerId, track.permalink)
+            android.util.Log.d(
+                "PlayerManager",
+                "resolveStreamUrl id=${track.providerId} -> ${res?.url} preview=${res?.isPreview}"
+            )
+            res?.url
         }
-        android.util.Log.d("PlayerManager", "resolveStreamUrl ${track.provider} id=${track.providerId} permalink=${track.permalink} -> $url")
-        return url
-    }
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     private val _state = MutableStateFlow(PlayerState())
@@ -133,7 +134,7 @@ class PlayerManager(
                 // so we hand the indirect URL to ExoPlayer and let it
                 // follow redirects + range-request the audio.
                 val streamUrl = resolveStreamUrl(track) ?: run {
-                    _state.update { it.copy(error = "Unsupported provider for ${track.title}") }
+                    _state.update { it.copy(error = "Couldn't resolve stream for ${track.title}") }
                     return@launch
                 }
 
@@ -194,7 +195,7 @@ class PlayerManager(
                     return@launch
                 }
                 val url = resolveStreamUrl(track) ?: run {
-                    _state.update { it.copy(error = "Unsupported provider for ${track.title}") }
+                    _state.update { it.copy(error = "Couldn't resolve stream for ${track.title}") }
                     return@launch
                 }
                 ctl.setMediaItem(mediaItem(track, url), 0)

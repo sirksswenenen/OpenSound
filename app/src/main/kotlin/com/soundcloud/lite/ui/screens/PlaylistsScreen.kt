@@ -230,7 +230,7 @@ fun PlaylistsScreen(
             text = {
                 Column {
                     Text(
-                        text = "Paste a SoundCloud or YouTube playlist URL.",
+                        text = "Paste a SoundCloud playlist URL (e.g. /user/sets/my-set).",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontSize = 12.sp,
                         modifier = Modifier.padding(bottom = 8.dp),
@@ -256,7 +256,7 @@ fun PlaylistsScreen(
                         ) {
                             CircularProgressIndicator(modifier = Modifier.padding(end = 12.dp))
                             Text(
-                                text = "Importing… matching tracks via Audius & YouTube",
+                                text = "Importing tracks…",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontSize = 12.sp,
                             )

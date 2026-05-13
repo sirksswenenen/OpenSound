@@ -39,7 +39,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.soundcloud.lite.data.AnimSpeed
-import com.soundcloud.lite.data.DownloadSource
 import com.soundcloud.lite.data.GlassQuality
 import com.soundcloud.lite.data.IconVariant
 import com.soundcloud.lite.data.ThemePreset
@@ -254,30 +253,6 @@ fun SettingsScreen(viewModel: MainViewModel) {
             Text(
                 "OAuth token unlocks full-length streams for Go+ subscribers. " +
                     "Get it from DevTools → Network → Authorization: OAuth <token>.",
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 6.dp)
-            )
-        }
-
-        Section("Download source") {
-            DownloadSource.values().forEach { src ->
-                SelectableRow(
-                    title = src.displayName,
-                    selected = settings.downloadSource == src,
-                    onClick = { viewModel.updateSettings { it.copy(downloadSource = src) } }
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
-                value = settings.cobaltUrl,
-                onValueChange = { v -> viewModel.updateSettings { it.copy(cobaltUrl = v) } },
-                label = { Text("Cobalt API URL") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Text(
-                "The public cobalt.tools instance is often rate-limited. Self-host or pick a mirror if downloads fail.",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 6.dp)

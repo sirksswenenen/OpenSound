@@ -74,10 +74,10 @@ class DownloadRepository(private val context: Context) {
         updateOrAdd(DownloadedTrack(track = track, localPath = "", status = DownloadStatus.DOWNLOADING, progress = 0))
 
         val dir = File(context.filesDir, "music").also { it.mkdirs() }
-        val ext = when (track.provider) {
-            Provider.YOUTUBE -> "m4a"
-            else -> "mp3"
-        }
+        // SoundCloud progressive streams are mp3-128. We keep the legacy
+        // "m4a" extension for downloads imported from YouTube on older
+        // versions so they still play out of the local cache.
+        val ext = if (track.provider == Provider.YOUTUBE) "m4a" else "mp3"
         val file = File(dir, "${track.id}.$ext")
 
         try {

@@ -28,7 +28,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
-import com.soundcloud.lite.api.Provider
 import com.soundcloud.lite.api.TrackInfo
 
 @Composable
@@ -92,33 +91,9 @@ fun TrackRow(
             )
         }
 
-        // Provider badge — always pinned to the right
-        ProviderBadge(track.provider)
-
         if (trailing != null) {
             Spacer(Modifier.width(6.dp))
             trailing()
         }
     }
-}
-
-@Composable
-private fun ProviderBadge(provider: Provider) {
-    val (text, bg) = when (provider) {
-        Provider.AUDIUS     -> "AUDIUS" to Color(0xFF7138B7)
-        Provider.YOUTUBE    -> "YT"     to Color(0xFFCC2222)
-        Provider.SOUNDCLOUD -> "SC"     to Color(0xFFFF5500)
-        Provider.UNKNOWN    -> return
-    }
-    Text(
-        text = text,
-        color = Color.White,
-        fontSize = 9.sp,
-        fontWeight = FontWeight.Bold,
-        modifier = Modifier
-            .padding(start = 6.dp)
-            .clip(RoundedCornerShape(3.dp))
-            .background(bg)
-            .padding(horizontal = 4.dp, vertical = 1.dp),
-    )
 }
