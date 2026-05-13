@@ -74,6 +74,20 @@ android {
         }
     }
 
+    // Haze (and a few other newer libs) pull in newer transitive
+    // versions of androidx.activity / animation-core etc. that
+    // demand compileSdk 35+ via AAR metadata. Pin everything to the
+    // exact versions we declare so the build stays on compileSdk 34.
+    configurations.all {
+        resolutionStrategy {
+            force(
+                "androidx.activity:activity:1.9.3",
+                "androidx.activity:activity-ktx:1.9.3",
+                "androidx.activity:activity-compose:1.9.3",
+            )
+        }
+    }
+
     packaging {
         resources {
             excludes += setOf(
