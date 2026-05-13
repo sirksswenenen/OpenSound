@@ -356,7 +356,7 @@ class SoundCloudApi(
         val seen = HashSet<String>(size)
         val out = ArrayList<TrackInfo>(size)
         for (t in this) {
-            val key = t.providerId.ifBlank { t.id }
+            val key = if (t.providerId.isNotBlank()) t.providerId else t.id.toString()
             if (seen.add(key)) out.add(t)
         }
         return out
