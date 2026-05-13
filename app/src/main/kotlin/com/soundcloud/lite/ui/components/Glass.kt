@@ -128,6 +128,7 @@ fun GlassSurface(
     // Glass tuning
     val tintScale = theme.glassTint.coerceIn(0f, 1f)
     val reflectionScale = theme.glassReflection.coerceIn(0f, 1f)
+    val highlightScale = theme.glassHighlight.coerceIn(0f, 1f)
     val blurAmount = theme.glassBlur.coerceIn(0f, 1f)
     val chromaAmount = theme.glassChroma.coerceIn(0f, 1f)
     val refraction = theme.glassRefraction.coerceIn(0f, 1f)
@@ -144,12 +145,12 @@ fun GlassSurface(
     val bottomHighlight: Color
     val sideHighlight: Color
     if (dark) {
-        topHighlight    = Color.White.copy(alpha = 0.28f)
-        bottomHighlight = Color.White.copy(alpha = 0.08f)
+        topHighlight    = Color.White.copy(alpha = 0.28f * highlightScale)
+        bottomHighlight = Color.White.copy(alpha = 0.08f * highlightScale)
         sideHighlight   = Color.White.copy(alpha = 0.55f)
     } else {
-        topHighlight    = Color.White.copy(alpha = 0.55f)
-        bottomHighlight = Color.White.copy(alpha = 0.20f)
+        topHighlight    = Color.White.copy(alpha = 0.55f * highlightScale)
+        bottomHighlight = Color.White.copy(alpha = 0.20f * highlightScale)
         sideHighlight   = Color.White.copy(alpha = 0.70f)
     }
 
@@ -480,22 +481,24 @@ fun GlassSurface(
                 .matchParentSize()
                 .background(Brush.verticalGradient(listOf(tintTop, tintMid, tintBottom)))
         )
-        // Top specular strip
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(14.dp)
-                .background(Brush.verticalGradient(0.0f to topHighlight, 1.0f to Color.Transparent))
-                .align(Alignment.TopCenter)
-        )
-        // Bottom specular strip
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(10.dp)
-                .background(Brush.verticalGradient(0.0f to Color.Transparent, 1.0f to bottomHighlight))
-                .align(Alignment.BottomCenter)
-        )
+        if (highlightScale > 0.01f) {
+            // Top specular strip
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(14.dp)
+                    .background(Brush.verticalGradient(0.0f to topHighlight, 1.0f to Color.Transparent))
+                    .align(Alignment.TopCenter)
+            )
+            // Bottom specular strip
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(10.dp)
+                    .background(Brush.verticalGradient(0.0f to Color.Transparent, 1.0f to bottomHighlight))
+                    .align(Alignment.BottomCenter)
+            )
+        }
         // Tilt-driven side reflections — brightness of the left/right
         // strips shifts with device lean, mimicking a real glass rim
         // catching ambient light.

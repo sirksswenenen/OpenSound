@@ -135,6 +135,14 @@ data class AppSettings(
     val glassTint: Float = 0.30f,
     /** Side reflection intensity in response to device tilt (0..1). */
     val glassReflection: Float = 0.55f,
+    /**
+     * Intensity of the top + bottom rim highlight strips drawn on glass
+     * panels (0..1). At 0 the strips are completely omitted, leaving the
+     * panel with only its blurred backdrop + tint. Useful when the small,
+     * tight glass capsules (e.g. the active-tab pill in the bottom bar)
+     * have rim highlights that look too pronounced.
+     */
+    val glassHighlight: Float = 0.55f,
     /** Chromatic aberration strength (0..1). */
     val glassChroma: Float = 0.25f,
     /** Corner radius for Liquid Glass panels, in dp (0..40). */
@@ -190,6 +198,7 @@ class SettingsRepository(context: Context) {
         glassBlur = prefs.getFloat("glass_blur", 0.55f),
         glassTint = prefs.getFloat("glass_tint", 0.30f),
         glassReflection = prefs.getFloat("glass_reflection", 0.55f),
+        glassHighlight = prefs.getFloat("glass_highlight", 0.55f),
         glassChroma = prefs.getFloat("glass_chroma", 0.25f),
         glassRadius = prefs.getFloat("glass_radius", 20f),
         glassRefraction = prefs.getFloat("glass_refraction", 0.20f),
@@ -217,6 +226,7 @@ class SettingsRepository(context: Context) {
             .putFloat("glass_blur", next.glassBlur)
             .putFloat("glass_tint", next.glassTint)
             .putFloat("glass_reflection", next.glassReflection)
+            .putFloat("glass_highlight", next.glassHighlight)
             .putFloat("glass_chroma", next.glassChroma)
             .putFloat("glass_radius", next.glassRadius)
             .putFloat("glass_refraction", next.glassRefraction)
