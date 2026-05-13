@@ -1,6 +1,7 @@
 package com.soundcloud.lite.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
@@ -393,7 +394,7 @@ private fun Modifier.dragContainer(state: DragDropState): Modifier = this.pointe
 
 /** Drag handle: starts immediately on press (no long-press required). */
 private fun Modifier.dragHandle(state: DragDropState, key: Any): Modifier = this.pointerInput(state, key) {
-    androidx.compose.foundation.gestures.detectDragGestures(
+    detectDragGestures(
         onDragStart = { offset -> state.onStart(offset.y) },
         onDrag = { change, drag ->
             change.consume()
