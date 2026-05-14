@@ -197,16 +197,18 @@ fun MiniPlayer(
             // outside its bounds.
             val miniBackdrop = rememberGraphicsLayer()
 
-            Box(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                // Layer 1 (offscreen): draw the strip content into
-                // miniBackdrop AND to the screen, so the capsule
-                // has something to refract AND the user can still
-                // see the controls.
+            // Layer 1 (sized): draws the strip content normally AND
+            // records it into miniBackdrop so the capsule has
+            // something to refract. This is the ONLY child that
+            // contributes intrinsic size to the outer Box -- the
+            // capsule overlay is matchParentSize and would otherwise
+            // collapse the parent to 0x0 (which is what broke the
+            // previous build: with Liquid Glass on the mini player
+            // had no height and never appeared on screen).
+            Box(modifier = Modifier.fillMaxWidth()) {
                 Box(
                     modifier = Modifier
-                        .matchParentSize()
+                        .fillMaxWidth()
                         .drawWithContent {
                             miniBackdrop.record { this@drawWithContent.drawContent() }
                             drawLayer(miniBackdrop)

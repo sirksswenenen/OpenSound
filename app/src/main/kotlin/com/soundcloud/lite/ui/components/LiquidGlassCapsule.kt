@@ -157,11 +157,17 @@ fun LiquidGlassCapsule(
     // is. We always want SOME lens, otherwise the pill turns into a
     // plain tinted box - so we clamp the lower end above zero.
     val refractAmount = theme.glassBlur.coerceIn(0f, 1f)
+    // Bumped from the previous (8+22) / (10+28) defaults: under the
+    // motion gate the visible warp lives for ~200ms during a slide
+    // and was reading as barely-there on screen. Increasing both the
+    // band height and the displacement makes the lens visibly distort
+    // the icon row when the pill is in flight without affecting the
+    // rest state (motion=0 still gives zero warp).
     val refractionHeightPx = with(density) {
-        (8.dp + 22.dp * refractAmount).toPx()
+        (12.dp + 32.dp * refractAmount).toPx()
     }
     val refractionAmountPx = with(density) {
-        (10.dp + 28.dp * refractAmount).toPx()
+        (14.dp + 42.dp * refractAmount).toPx()
     }
 
     val highlightStrength = (theme.glassHighlight).coerceIn(0f, 1f)
