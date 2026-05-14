@@ -187,44 +187,47 @@ fun MiniPlayer(
 
     when {
         glassOn && liquidOn -> {
-            // Capture the strip's content into a private GraphicsLayer
-            // and pipe it through the LiquidGlassCapsule shader, so
-            // the rim distortion on the rounded-rect actually warps
-            // what's drawn inside the strip (artwork edge, text near
-            // the edges). The backdrop offset is (0,0) because we
-            // sample from the strip's own layer, not the global
-            // app backdrop -- so the lens never re-uses pixels from
-            // outside its bounds.
+            // Two stacked effects:
+            //  1. GlassSurface wraps the strip - that's what actually
+            //     blurs the app pixels behind the mini-player and
+            //     applies the frosted tint. Without this wrap the
+            //     strip rendered as fully transparent on screen (no
+            //     blur, no tint), which was the regression the user
+            //     hit on v0.5.5.
+            //  2. LiquidGlassCapsule on top reads the strip's *own*
+            //     drawn content (captured into miniBackdrop) and
+            //     pushes it through the AGSL refraction shader, so
+            //     the rounded edges visibly distort artwork/labels
+            //     during the motion pulse fired on track change.
             val miniBackdrop = rememberGraphicsLayer()
+            GlassSurface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = miniShape,
+            ) {
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    // Layer 1: strip content. Sized normally, so it
+                    // gives the outer Box its intrinsic height (the
+                    // capsule overlay below is matchParentSize and
+                    // would otherwise leave the Box at 0x0).
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .drawWithContent {
+                                miniBackdrop.record { this@drawWithContent.drawContent() }
+                                drawLayer(miniBackdrop)
+                            }
+                    ) { content() }
 
-            // Layer 1 (sized): draws the strip content normally AND
-            // records it into miniBackdrop so the capsule has
-            // something to refract. This is the ONLY child that
-            // contributes intrinsic size to the outer Box -- the
-            // capsule overlay is matchParentSize and would otherwise
-            // collapse the parent to 0x0 (which is what broke the
-            // previous build: with Liquid Glass on the mini player
-            // had no height and never appeared on screen).
-            Box(modifier = Modifier.fillMaxWidth()) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .drawWithContent {
-                            miniBackdrop.record { this@drawWithContent.drawContent() }
-                            drawLayer(miniBackdrop)
-                        }
-                ) { content() }
-
-                // Layer 2: the lens. Sits ON TOP of the rendered
-                // strip, so the rim warp visibly distorts the
-                // artwork / labels along the rounded edges while
-                // the motion gate is non-zero.
-                LiquidGlassCapsule(
-                    modifier = Modifier.matchParentSize(),
-                    cornerRadiusDp = 20.dp,
-                    backdropLayer = miniBackdrop,
-                    motionAmount = miniMotion.value,
-                )
+                    // Layer 2: the AGSL rim lens. Refracts the
+                    // captured strip pixels around the rounded edges
+                    // while motionAmount > 0.
+                    LiquidGlassCapsule(
+                        modifier = Modifier.matchParentSize(),
+                        cornerRadiusDp = 20.dp,
+                        backdropLayer = miniBackdrop,
+                        motionAmount = miniMotion.value,
+                    )
+                }
             }
         }
         glassOn -> {
