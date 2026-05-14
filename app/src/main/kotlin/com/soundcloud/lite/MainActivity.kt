@@ -47,6 +47,8 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.width
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -331,12 +333,10 @@ fun AppRoot(viewModel: MainViewModel) {
     val chromaAmount = LocalSCTheme.current.glassChroma
     val refractionAmount = LocalSCTheme.current.glassRefraction
     val glassQuality = LocalSCTheme.current.glassQuality
-    val useGpuEffects = LocalSCTheme.current.glassUseGpuEffects
     val blurAmountState = androidx.compose.runtime.rememberUpdatedState(blurAmount)
     val chromaAmountState = androidx.compose.runtime.rememberUpdatedState(chromaAmount)
     val refractionAmountState = androidx.compose.runtime.rememberUpdatedState(refractionAmount)
     val glassQualityState = androidx.compose.runtime.rememberUpdatedState(glassQuality)
-    val useGpuEffectsState = androidx.compose.runtime.rememberUpdatedState(useGpuEffects)
     var blurredBackdrop by remember { mutableStateOf<ImageBitmap?>(null) }
     // captureScale + radius cap come from the user-selectable
     // GlassQuality. Low (0.16, max r=36, frameSkip=2) trades blur
@@ -398,15 +398,15 @@ fun AppRoot(viewModel: MainViewModel) {
             val chr = chromaAmountState.value
             val refr = refractionAmountState.value
             val quality = glassQualityState.value
-            val gpu = useGpuEffectsState.value
-            // Note: in GPU-effects mode GlassSurface does its own
-            // blur via Modifier.blur on the layer, so the heavy
-            // StackBlur work below isn't needed for the bar. But
-            // LiquidGlassCapsule (the active-tab pill) ALWAYS needs
-            // a sampled bitmap of the backdrop to feed into its
-            // RuntimeShader — so we keep capturing here at low cost
-            // (downsample only, no StackBlur) even in GPU mode.
-            val gpuOnly = gpu
+            // GPU-only rendering is now the only supported path: the
+            // CPU StackBlur fallback path was removed entirely. The
+            // GlassSurface uses Modifier.blur on its layer, so the
+            // heavy StackBlur work below isn't needed for the bar.
+            // LiquidGlassCapsule (the active-tab pill) still needs a
+            // sampled bitmap of the backdrop for its RuntimeShader,
+            // so we keep capturing here at low cost (downsample
+            // only, no StackBlur).
+            val gpuOnly = true
             // We always capture when liquidGlass is on: even with all
             // sliders at 0 the LiquidGlassCapsule (active-tab pill)
             // needs a sampled backdrop bitmap for its RuntimeShader.
@@ -746,14 +746,34 @@ private fun GlassNavigationBar(
     onSelect: (String) -> Unit,
 ) {
     val selectedIndex = tabs.indexOfFirst { it.route == currentRoute }.coerceAtLeast(0)
+    // Smooth, non-bouncy slide between tabs. The previous MediumBouncy
+    // spring overshot the target X position multiple times, which read
+    // as the whole nav bar subtly "growing/shrinking" between screens.
     val animatedIndex by animateFloatAsState(
         targetValue = selectedIndex.toFloat(),
         animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessLow,
+            dampingRatio = Spring.DampingRatioNoBouncy,
+            stiffness = Spring.StiffnessMediumLow,
         ),
         label = "navIndicator",
     )
+
+    // Drives the LiquidGlass refraction gate. Snaps to 1 the instant
+    // a tab is selected and decays to 0 over the duration of the
+    // slide, so the rim warp on the icons under the capsule only
+    // shows up DURING the move - at rest the captured icons read
+    // straight through with no distortion.
+    val pillMotion = remember { Animatable(0f) }
+    LaunchedEffect(selectedIndex) {
+        pillMotion.snapTo(1f)
+        pillMotion.animateTo(
+            targetValue = 0f,
+            animationSpec = tween(
+                durationMillis = 450,
+                easing = FastOutSlowInEasing,
+            ),
+        )
+    }
 
     val barShape = RoundedCornerShape(28.dp)
     val capsuleShape = RoundedCornerShape(24.dp)
@@ -873,6 +893,7 @@ private fun GlassNavigationBar(
                                 modifier = Modifier.fillMaxSize(),
                                 cornerRadiusDp = 24.dp,
                                 backdropLayer = barBackdropLayer,
+                                motionAmount = pillMotion.value,
                                 backdropOffset = {
                                     // Capsule lives at
                                     // (cellWidthPx * animatedIndex +

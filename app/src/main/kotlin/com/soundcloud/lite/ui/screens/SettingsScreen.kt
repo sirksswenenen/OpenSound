@@ -204,17 +204,6 @@ fun SettingsScreen(viewModel: MainViewModel) {
                         onClick = { viewModel.updateSettings { it.copy(glassQuality = q) } }
                     )
                 }
-                ToggleRow(
-                    title = "GPU effects (experimental)",
-                    subtitle = "Run blur and refraction on the GPU instead of " +
-                        "CPU StackBlur. Tracks the live UI at 60 fps but " +
-                        "chromatic aberration is ignored. Disable if the " +
-                        "panel looks transparent or flickers.",
-                    checked = settings.glassUseGpuEffects,
-                    onCheckedChange = { v ->
-                        viewModel.updateSettings { it.copy(glassUseGpuEffects = v) }
-                    },
-                )
                 ColorPickerRow(
                     label = "Glass tint colour",
                     color = settings.glassTintColor,

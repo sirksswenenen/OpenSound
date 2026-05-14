@@ -140,13 +140,22 @@ fun LiquidGlassCapsule(
      * animated capsule position stays in sync with the refraction.
      */
     backdropOffset: () -> Offset = { Offset.Zero },
+    /**
+     * 0..1 gate on the AGSL refraction. At 0 the rim distortion is
+     * effectively disabled and the capsule shows the captured
+     * backdrop straight through; at 1 the full lens runs. Callers
+     * typically ramp this 0 → 1 → 0 during a move animation so the
+     * iOS "liquid" warp only fires while the pill is sliding and
+     * the underlying icons read crisply when it is at rest.
+     */
+    motionAmount: Float = 1f,
 ) {
     val theme = LocalSCTheme.current
     val density = LocalDensity.current
 
     // 0..1 user setting controlling how aggressive the refraction
     // is. We always want SOME lens, otherwise the pill turns into a
-    // plain tinted box — so we clamp the lower end above zero.
+    // plain tinted box - so we clamp the lower end above zero.
     val refractAmount = theme.glassBlur.coerceIn(0f, 1f)
     val refractionHeightPx = with(density) {
         (8.dp + 22.dp * refractAmount).toPx()
@@ -179,7 +188,15 @@ fun LiquidGlassCapsule(
     var sizePx by remember { mutableStateOf(IntSize.Zero) }
     val cornerRadiusPx = with(density) { cornerRadiusDp.toPx() }
 
-    val renderEffect = remember(sizePx, cornerRadiusPx, refractionHeightPx, refractionAmountPx) {
+    // Bucket motion to the nearest 0.02 so we don't churn a new
+    // RenderEffect on every single frame for sub-pixel motion
+    // changes. Reading the motion here makes this composable
+    // recompose during the slide animation, but only this small
+    // subtree (the capsule), and only while motion is non-zero.
+    val gatedMotion = (motionAmount.coerceIn(0f, 1f) * 50f).toInt() / 50f
+    val effectiveRefraction = -refractionAmountPx * gatedMotion
+
+    val renderEffect = remember(sizePx, cornerRadiusPx, refractionHeightPx, effectiveRefraction) {
         if (sizePx.width <= 0 || sizePx.height <= 0) {
             null
         } else {
@@ -199,9 +216,10 @@ fun LiquidGlassCapsule(
             )
             shader.setFloatUniform("refractionHeight", refractionHeightPx)
             // Shader pushes coords outwards along the gradient when
-            // `refractionAmount` is negative — matching how the
-            // upstream library invokes it.
-            shader.setFloatUniform("refractionAmount", -refractionAmountPx)
+            // `refractionAmount` is negative - matching how the
+            // upstream library invokes it. We multiply by motion
+            // so at rest the displacement is exactly 0 (no warp).
+            shader.setFloatUniform("refractionAmount", effectiveRefraction)
             shader.setFloatUniform("depthEffect", 0f)
             AndroidRenderEffect
                 .createRuntimeShaderEffect(shader, "content")
@@ -210,7 +228,7 @@ fun LiquidGlassCapsule(
     }
 
     Box(modifier = modifier.clip(shape)) {
-        // Refraction lens — drawBehind paints the backdrop layer
+        // Refraction lens - drawBehind paints the backdrop layer
         // INTO this Box's graphicsLayer; the layer's renderEffect
         // then refracts those pixels via the AGSL shader before
         // they hit the screen.
