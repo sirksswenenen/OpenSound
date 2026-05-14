@@ -156,14 +156,6 @@ data class AppSettings(
     val glassRefraction: Float = 0.20f,
     /** Real-time blur quality preset. */
     val glassQuality: GlassQuality = GlassQuality.Balanced,
-    /**
-     * Experimental: when true, use the GPU's `Modifier.blur` /
-     * `RenderEffect.createBlurEffect` instead of the CPU StackBlur
-     * pipeline. Eliminates the per-frame HW→SW round-trip so the
-     * blur tracks the live UI at 60 fps. Chromatic aberration is
-     * not supported in GPU mode and is silently ignored.
-     */
-    val glassUseGpuEffects: Boolean = false,
     /** Tint color for Liquid Glass, packed ARGB (alpha channel ignored; alpha comes from glassTint). */
     val glassTintColor: Long = 0xFF1A0037L,
     val animationSpeed: AnimSpeed = AnimSpeed.Fast,
@@ -203,7 +195,6 @@ class SettingsRepository(context: Context) {
         glassRadius = prefs.getFloat("glass_radius", 20f),
         glassRefraction = prefs.getFloat("glass_refraction", 0.20f),
         glassQuality = enumSafe<GlassQuality>(prefs.getString("glass_quality", null)) ?: GlassQuality.Balanced,
-        glassUseGpuEffects = prefs.getBoolean("glass_gpu_effects", false),
         glassTintColor = prefs.getLong("glass_tint_color", 0xFF1A0037L),
         animationSpeed = enumSafe<AnimSpeed>(prefs.getString("anim_speed", null)) ?: AnimSpeed.Fast,
         downloadSource = enumSafe<DownloadSource>(prefs.getString("dl_source", null)) ?: DownloadSource.Auto,
@@ -231,7 +222,6 @@ class SettingsRepository(context: Context) {
             .putFloat("glass_radius", next.glassRadius)
             .putFloat("glass_refraction", next.glassRefraction)
             .putString("glass_quality", next.glassQuality.name)
-            .putBoolean("glass_gpu_effects", next.glassUseGpuEffects)
             .putLong("glass_tint_color", next.glassTintColor)
             .putString("anim_speed", next.animationSpeed.name)
             .putString("dl_source", next.downloadSource.name)

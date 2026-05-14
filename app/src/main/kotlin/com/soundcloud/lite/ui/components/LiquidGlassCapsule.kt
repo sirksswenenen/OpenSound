@@ -54,6 +54,14 @@ private const val LIQUID_GLASS_AGSL = """
     uniform float refraction;
     uniform float chroma;
     uniform float highlight;
+    // 0..1 — gates rim displacement + chromatic aberration. The
+    // x-biased lens distortion is what produces the visible warping
+    // along the long sides of the capsule, so we only want it to
+    // run while the capsule is actively moving (e.g. sliding between
+    // bottom-nav tabs). When at rest, motion is 0 and the panel
+    // shows the blurred backdrop straight through, with no edge
+    // warping or rainbow rim.
+    uniform float motion;
 
     half4 main(float2 fragCoord) {
         // Centered normalized coords in (-1, 1).
@@ -62,11 +70,14 @@ private const val LIQUID_GLASS_AGSL = """
         // Radial distance with a slight x-bias so the rim displacement
         // distributes evenly along the capsule's long axis. A pure
         // length() would put all the refraction at the rounded ends.
+        // The x-bias is intentionally kept (per user request) — but
+        // its displacement effect is multiplied by `motion` below so
+        // the warp only shows up DURING a slide animation.
         float aspect = size.x / max(size.y, 1.0);
         float2 c = float2(uv.x * 0.55, uv.y);
         float r = length(c);
         float r2 = r * r;
-        float disp = refraction * r2 * 0.55;
+        float disp = refraction * r2 * 0.55 * motion;
 
         // Outward unit vector for lensing.
         float2 dir = c / max(r, 1e-4);
@@ -76,7 +87,9 @@ private const val LIQUID_GLASS_AGSL = """
         // refraction direction. Strength scales both with the chroma
         // uniform and with how close we are to the rim — so the
         // centre stays neutral and the colour fringes ride the edge.
-        float ca = chroma * 4.0 * r;
+        // Also gated by `motion`, so the colour fringe only appears
+        // while the capsule is moving.
+        float ca = chroma * 4.0 * r * motion;
         half4 cr = backdrop.eval(displaced + dir * ca);
         half4 cg = backdrop.eval(displaced);
         half4 cb = backdrop.eval(displaced - dir * ca);
@@ -84,6 +97,8 @@ private const val LIQUID_GLASS_AGSL = """
 
         // Top specular crescent — bright lip near the top of the
         // capsule, tapering off downwards. uv.y is -1 at the top.
+        // The crescent is a static decoration ("lit from above") so
+        // it does NOT depend on `motion`.
         float topArc = pow(max(0.0, -uv.y - 0.45), 1.6);
         color += half3(topArc * highlight * 0.85);
 
@@ -113,6 +128,14 @@ fun LiquidGlassCapsule(
     chroma: Float = 0.30f,
     highlight: Float = 0.45f,
     tintColor: Color = Color.White.copy(alpha = 0.12f),
+    /**
+     * 0..1 — gates the rim distortion + chromatic aberration. The
+     * x-biased lens warp that runs along the long sides of the
+     * capsule is only visible while this value is > 0, so callers
+     * can ramp it from 0 → 1 → 0 during a slide animation and the
+     * panel looks like clean glass at rest.
+     */
+    motionAmount: Float = 1f,
 ) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
         // Pre-API 33 fallback — just a soft translucent tinted box.
@@ -130,6 +153,7 @@ fun LiquidGlassCapsule(
         chroma = chroma,
         highlight = highlight,
         tintColor = tintColor,
+        motionAmount = motionAmount,
     )
 }
 
@@ -142,6 +166,7 @@ private fun LiquidGlassCapsuleApi33(
     chroma: Float,
     highlight: Float,
     tintColor: Color,
+    motionAmount: Float,
 ) {
     val blurredBackdrop = LocalBlurredBackdrop.current
     val backdropScale = LocalBlurredBackdropScale.current
@@ -212,6 +237,10 @@ private fun LiquidGlassCapsuleApi33(
                         shader.setFloatUniform("refraction", refractionAmount)
                         shader.setFloatUniform("chroma", chroma)
                         shader.setFloatUniform("highlight", effectiveHighlight)
+                        shader.setFloatUniform(
+                            "motion",
+                            motionAmount.coerceIn(0f, 1f),
+                        )
                         androidPaint.shader = shader
                         drawIntoCanvas { canvas ->
                             canvas.nativeCanvas.drawRect(0f, 0f, w, h, androidPaint)

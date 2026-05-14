@@ -157,7 +157,11 @@ fun GlassSurface(
     val backdropLayer = LocalBackdropLayer.current
     val backdropOrigin = LocalBackdropOrigin.current
     val tilt = LocalTilt.current
-    val useGpu = theme.glassUseGpuEffects
+    // GPU is the only supported blur path now. The legacy CPU StackBlur
+    // branch below is kept for code-history reasons but is no longer
+    // reachable from runtime - the experimental GPU-effects toggle was
+    // removed per user request because the CPU path was slow and laggy.
+    val useGpu = true
 
     var panelPos by remember { mutableStateOf(Offset.Zero) }
 
