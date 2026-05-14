@@ -157,7 +157,10 @@ fun GlassSurface(
     val backdropLayer = LocalBackdropLayer.current
     val backdropOrigin = LocalBackdropOrigin.current
     val tilt = LocalTilt.current
-    val useGpu = theme.glassUseGpuEffects
+    // GPU rendering is the only supported path; the legacy CPU
+    // StackBlur fallback was removed because it ran at <12 fps and
+    // looked semi-transparent on Adreno / MIUI A13 anyway.
+    val useGpu = true
 
     var panelPos by remember { mutableStateOf(Offset.Zero) }
 

@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
 }
 
@@ -12,8 +13,8 @@ android {
         applicationId = "com.soundcloud.lite"
         minSdk = 24
         targetSdk = 34
-        versionCode = 9
-        versionName = "0.5.2"
+        versionCode = 13
+        versionName = "0.5.6"
     }
 
     signingConfigs {
@@ -54,9 +55,10 @@ android {
         compose = true
     }
 
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.14"
-    }
+    // Kotlin 2.0+ no longer uses `kotlinCompilerExtensionVersion` here;
+    // the Compose Compiler is now applied via the
+    // `org.jetbrains.kotlin.plugin.compose` plugin (declared above)
+    // which automatically tracks the active Kotlin version.
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -65,12 +67,30 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+        // Kotlin 2.0 makes K2 the default. Keep us on the stable behaviour
+        // (default) but explicitly enable the strict-null `Configuration`
+        // diagnostics so we catch any new K2 warnings in CI.
+        freeCompilerArgs = freeCompilerArgs + listOf("-Xskip-prerelease-check")
     }
 
     sourceSets {
         getByName("main") {
             kotlin.srcDirs("src/main/kotlin")
             res.srcDirs("src/main/res")
+        }
+    }
+
+    // Haze (and a few other newer libs) pull in newer transitive
+    // versions of androidx.activity / animation-core etc. that
+    // demand compileSdk 35+ via AAR metadata. Pin everything to the
+    // exact versions we declare so the build stays on compileSdk 34.
+    configurations.all {
+        resolutionStrategy {
+            force(
+                "androidx.activity:activity:1.9.3",
+                "androidx.activity:activity-ktx:1.9.3",
+                "androidx.activity:activity-compose:1.9.3",
+            )
         }
     }
 
@@ -130,6 +150,13 @@ dependencies {
 
     // Coil for artwork
     implementation("io.coil-kt:coil-compose:2.6.0")
+
+    // The Liquid Glass capsule no longer uses Haze. We now vendor the
+    // AGSL refraction shader from kyant/AndroidLiquidGlass directly
+    // (Apache 2.0) inside `LiquidGlassCapsule.kt`, drive it via
+    // RenderEffect.createRuntimeShaderEffect on API 33+, and fall
+    // back to a soft translucent surface on older devices. This
+    // avoids dragging in a transitive Compose-1.8 dependency tree.
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")

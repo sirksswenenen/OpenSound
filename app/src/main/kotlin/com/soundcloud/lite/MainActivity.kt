@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -47,9 +48,25 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.width
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.drag
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
+import kotlin.math.roundToInt
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -280,7 +297,13 @@ fun AppRoot(viewModel: MainViewModel) {
     // Hide bottom bar + miniplayer while full-screen player is open.
     val onPlayer = currentRoute == "player"
 
-    val glassOn = LocalSCTheme.current.liquidGlass
+    // The bottom nav capsule uses the Haze-based Liquid Glass lens
+    // whenever the master "Glass surfaces" toggle is on. Previously
+    // we gated this on the separate `liquidGlass` toggle, which led
+    // to users having the master toggle on but `liquidGlass` off and
+    // therefore seeing the plain coloured pill (looked like a "glow")
+    // instead of the refracting lens.
+    val glassOn = LocalSCTheme.current.glassEnabled
 
     // GraphicsLayer capturing the list/AppNavHost content so the
     // MiniPlayer overlay can sample it for backdrop blur. Only
@@ -325,12 +348,10 @@ fun AppRoot(viewModel: MainViewModel) {
     val chromaAmount = LocalSCTheme.current.glassChroma
     val refractionAmount = LocalSCTheme.current.glassRefraction
     val glassQuality = LocalSCTheme.current.glassQuality
-    val useGpuEffects = LocalSCTheme.current.glassUseGpuEffects
     val blurAmountState = androidx.compose.runtime.rememberUpdatedState(blurAmount)
     val chromaAmountState = androidx.compose.runtime.rememberUpdatedState(chromaAmount)
     val refractionAmountState = androidx.compose.runtime.rememberUpdatedState(refractionAmount)
     val glassQualityState = androidx.compose.runtime.rememberUpdatedState(glassQuality)
-    val useGpuEffectsState = androidx.compose.runtime.rememberUpdatedState(useGpuEffects)
     var blurredBackdrop by remember { mutableStateOf<ImageBitmap?>(null) }
     // captureScale + radius cap come from the user-selectable
     // GlassQuality. Low (0.16, max r=36, frameSkip=2) trades blur
@@ -392,15 +413,15 @@ fun AppRoot(viewModel: MainViewModel) {
             val chr = chromaAmountState.value
             val refr = refractionAmountState.value
             val quality = glassQualityState.value
-            val gpu = useGpuEffectsState.value
-            // Note: in GPU-effects mode GlassSurface does its own
-            // blur via Modifier.blur on the layer, so the heavy
-            // StackBlur work below isn't needed for the bar. But
-            // LiquidGlassCapsule (the active-tab pill) ALWAYS needs
-            // a sampled bitmap of the backdrop to feed into its
-            // RuntimeShader — so we keep capturing here at low cost
-            // (downsample only, no StackBlur) even in GPU mode.
-            val gpuOnly = gpu
+            // GPU-only rendering is now the only supported path: the
+            // CPU StackBlur fallback path was removed entirely. The
+            // GlassSurface uses Modifier.blur on its layer, so the
+            // heavy StackBlur work below isn't needed for the bar.
+            // LiquidGlassCapsule (the active-tab pill) still needs a
+            // sampled bitmap of the backdrop for its RuntimeShader,
+            // so we keep capturing here at low cost (downsample
+            // only, no StackBlur).
+            val gpuOnly = true
             // We always capture when liquidGlass is on: even with all
             // sliders at 0 the LiquidGlassCapsule (active-tab pill)
             // needs a sampled backdrop bitmap for its RuntimeShader.
@@ -688,7 +709,9 @@ fun AppRoot(viewModel: MainViewModel) {
                         .matchParentSize()
                         .background(bgBrush)
                 )
-                AppNavHost(navController = navController, viewModel = viewModel)
+                Box(modifier = Modifier.fillMaxSize()) {
+                    AppNavHost(navController = navController, viewModel = viewModel)
+                }
             }
 
             // MiniPlayer overlay — sits at the bottom of the content
@@ -738,17 +761,70 @@ private fun GlassNavigationBar(
     onSelect: (String) -> Unit,
 ) {
     val selectedIndex = tabs.indexOfFirst { it.route == currentRoute }.coerceAtLeast(0)
-    val animatedIndex by animateFloatAsState(
-        targetValue = selectedIndex.toFloat(),
+    val scope = rememberCoroutineScope()
+
+    // Spring-driven horizontal position of the capsule, measured in
+    // "tab indices" (0..tabs.size-1). Switched from animateFloatAsState
+    // to a manual Animatable so we can snapTo(...) the value when the
+    // user releases a drag — that way the pill stays exactly where the
+    // finger left it and then smoothly springs to the new selected
+    // tab, rather than visibly teleporting back to the old position.
+    val pillIndex = remember { Animatable(selectedIndex.toFloat()) }
+    LaunchedEffect(selectedIndex) {
+        pillIndex.animateTo(
+            targetValue = selectedIndex.toFloat(),
+            animationSpec = spring(
+                dampingRatio = Spring.DampingRatioNoBouncy,
+                stiffness = Spring.StiffnessMediumLow,
+            ),
+        )
+    }
+    val animatedIndex = pillIndex.value
+
+    // Long-press-and-drag state. While the user is holding the pill
+    // and moving horizontally we override pillIndex from
+    // (selectedIndex, dragOffsetPx) and freeze the motion gate at 1
+    // so the AGSL refraction is *live* under the user's finger.
+    var isDraggingPill by remember { mutableStateOf(false) }
+    var dragOffsetPx by remember { mutableFloatStateOf(0f) }
+
+    // Slight visible "grow" of the pill while the user has it
+    // pressed. Pure visual feedback that the gesture was picked up.
+    val pillScale by animateFloatAsState(
+        targetValue = if (isDraggingPill) 1.10f else 1f,
         animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessLow,
+            dampingRatio = Spring.DampingRatioNoBouncy,
+            stiffness = Spring.StiffnessMedium,
         ),
-        label = "navIndicator",
+        label = "pillScale",
     )
 
-    val barShape = RoundedCornerShape(28.dp)
-    val capsuleShape = RoundedCornerShape(24.dp)
+    // Drives the LiquidGlass refraction gate. Stays at 1 while the
+    // slide is in flight (i.e. the spring hasn't settled to the
+    // target index, OR the user is dragging the pill), then fades
+    // to 0 over 220 ms once the pill comes to rest. The previous
+    // tween-to-zero from frame 0 was decaying *during* the slide,
+    // which made the rim warp barely visible by the time the pill
+    // was mid-flight.
+    val pillMotion = remember { Animatable(0f) }
+    val sliding = isDraggingPill ||
+        abs(animatedIndex - selectedIndex.toFloat()) > 0.01f
+    LaunchedEffect(sliding) {
+        if (sliding) {
+            pillMotion.snapTo(1f)
+        } else {
+            pillMotion.animateTo(
+                targetValue = 0f,
+                animationSpec = tween(
+                    durationMillis = 220,
+                    easing = FastOutSlowInEasing,
+                ),
+            )
+        }
+    }
+
+    val barShape = RoundedCornerShape(32.dp)
+    val capsuleShape = RoundedCornerShape(28.dp)
 
     CompositionLocalProvider(
         com.soundcloud.lite.ui.components.LocalSafeForGlass provides false,
@@ -757,75 +833,196 @@ private fun GlassNavigationBar(
             modifier = Modifier
                 .fillMaxWidth()
                 .windowInsetsPadding(WindowInsets.navigationBars)
-                .padding(horizontal = 10.dp, vertical = 8.dp),
+                .padding(horizontal = 14.dp, vertical = 10.dp),
         ) {
             val barWidth = maxWidth
             val cellWidth = barWidth / tabs.size.coerceAtLeast(1)
-            val capsuleInset = 6.dp
+            val capsuleInset = 4.dp
             val capsuleWidth = cellWidth - capsuleInset * 2
-            val barHeight = 64.dp
+            val barHeight = 72.dp
+            val capsuleWidthPx = with(LocalDensity.current) { capsuleWidth.toPx() }
+
+            // Backdrop layer that holds a snapshot of the bar's icon
+            // row. The capsule reads from it through an AGSL
+            // refraction shader, which is what produces the iOS
+            // "Liquid Glass" lens — icons under the moving capsule
+            // visibly distort while icons outside stay crisp.
+            //
+            // (Yes, every recomposition of this bar reallocates the
+            //  layer if you don't memoise — `rememberGraphicsLayer`
+            //  handles that for us and disposes the GPU resource on
+            //  exit.)
+            val barBackdropLayer = rememberGraphicsLayer()
+            val capsuleDensity = LocalDensity.current
+            val capsuleInsetPx = with(capsuleDensity) { capsuleInset.toPx() }
+            val cellWidthPx = with(capsuleDensity) { cellWidth.toPx() }
+            // Right-most pill anchor in pixels — used by the
+            // pointer-input drag math to clamp the pill to the bar
+            // bounds (declared up here so it's in scope for both the
+            // gesture handler and the rendering block below).
+            val maxBarPx = with(capsuleDensity) {
+                (cellWidth * (tabs.size - 1).coerceAtLeast(0)).toPx()
+            }
 
             val barContent: @Composable () -> Unit = {
-                Box(modifier = Modifier.fillMaxWidth().height(barHeight)) {
-                    // Sliding capsule indicator behind the active icon.
-                    // When Liquid Glass is enabled we use the dedicated
-                    // RuntimeShader capsule so the backdrop refracts as
-                    // the pill slides between tabs (iOS Liquid Glass).
-                    // Otherwise we fall back to the existing GlassSurface
-                    // (or a flat tint when glass is fully off).
-                    val liquidOn = LocalSCTheme.current.liquidGlass
-                    Box(
-                        modifier = Modifier
-                            .padding(vertical = capsuleInset)
-                            .offset(x = cellWidth * animatedIndex + capsuleInset)
-                            .width(capsuleWidth)
-                            .fillMaxHeight(),
-                    ) {
-                        when {
-                            liquidOn && glassOn -> {
-                                com.soundcloud.lite.ui.components.LiquidGlassCapsule(
-                                    modifier = Modifier.fillMaxSize(),
-                                    shape = capsuleShape,
-                                )
-                            }
-                            glassOn -> {
-                                com.soundcloud.lite.ui.components.GlassSurface(
-                                    modifier = Modifier.fillMaxSize(),
-                                    shape = capsuleShape,
-                                ) { }
-                            }
-                            else -> {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .background(
-                                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
-                                            shape = capsuleShape,
-                                        ),
-                                )
-                            }
-                        }
-                    }
+                // The bar is rendered in two z-stacked visual layers
+                // and a single top-level gesture handler:
+                //
+                //   1. Icons row, recorded into `barBackdropLayer` AND
+                //      drawn normally. No click handlers — gestures
+                //      live on the outer pointerInput below.
+                //   2. The sliding capsule. Reads from
+                //      `barBackdropLayer` through an AGSL refraction
+                //      shader. Where it overlaps an icon, the icon is
+                //      rendered visibly distorted; outside the
+                //      capsule the icons stay crisp.
+                //
+                // Gestures (tap on a tab, long-press-and-drag on the
+                // pill) are handled in one `awaitEachGesture` block
+                // on the bar root so a long-press inside the pill's
+                // bounds is never stolen by a transparent click
+                // hit-box layer above it (which is what was killing
+                // the long-press in the previous build).
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(barHeight)
+                        .pointerInput(
+                            tabs.size,
+                            cellWidthPx,
+                            capsuleInsetPx,
+                            capsuleWidthPx,
+                            selectedIndex,
+                        ) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                val downX = down.position.x
 
-                    Row(modifier = Modifier.fillMaxSize()) {
+                                // Where is the visible pill right now?
+                                // We use selectedIndex (not animatedIndex)
+                                // because that's the pill the user is
+                                // looking at when they put their finger
+                                // down - the spring lerp position is
+                                // moving and would be confusing to test
+                                // against.
+                                val pillLeft =
+                                    cellWidthPx * selectedIndex.toFloat() +
+                                        capsuleInsetPx
+                                val pillRight = pillLeft + capsuleWidthPx
+                                val onPill = downX in pillLeft..pillRight
+
+                                // Phase 1: wait for either (a) a release
+                                // before long-press timeout = tap, or
+                                // (b) the long-press timeout elapsing
+                                // while the finger is still down on the
+                                // pill = drag begins, or (c) movement
+                                // past slop before the timeout = cancel.
+                                val pressedLongEnough = withTimeoutOrNull(
+                                    viewConfiguration.longPressTimeoutMillis,
+                                ) {
+                                    var result = false
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val ch = event.changes.firstOrNull {
+                                            it.id == down.id
+                                        } ?: break
+                                        if (ch.changedToUpIgnoreConsumed()) {
+                                            // Released before timeout -> tap.
+                                            result = false
+                                            break
+                                        }
+                                        val travel = (ch.position - down.position)
+                                            .getDistance()
+                                        if (travel > viewConfiguration.touchSlop) {
+                                            // Moved before timeout -> treat
+                                            // as cancel (user is probably
+                                            // trying to scroll the screen).
+                                            result = false
+                                            break
+                                        }
+                                    }
+                                    result
+                                } ?: true
+
+                                if (pressedLongEnough && onPill) {
+                                    // ── long-press confirmed on pill -> drag ──
+                                    isDraggingPill = true
+                                    dragOffsetPx = 0f
+                                    scope.launch { pillMotion.snapTo(1f) }
+
+                                    drag(down.id) { change ->
+                                        dragOffsetPx += change.positionChange().x
+                                        change.consume()
+                                    }
+
+                                    // Released. Snap pillIndex to the
+                                    // release position and let the
+                                    // spring continue smoothly to the
+                                    // newly-selected tab.
+                                    val anchorPx =
+                                        cellWidthPx * selectedIndex.toFloat()
+                                    val curPx = (anchorPx + dragOffsetPx)
+                                        .coerceIn(0f, maxBarPx)
+                                    val cur = curPx / cellWidthPx
+                                    val target = cur.roundToInt()
+                                        .coerceIn(0, tabs.size - 1)
+                                    scope.launch {
+                                        pillIndex.snapTo(cur)
+                                        if (target != selectedIndex) {
+                                            onSelect(tabs[target].route)
+                                        } else {
+                                            pillIndex.animateTo(
+                                                targetValue = selectedIndex.toFloat(),
+                                                animationSpec = spring(
+                                                    dampingRatio = Spring.DampingRatioNoBouncy,
+                                                    stiffness = Spring.StiffnessMediumLow,
+                                                ),
+                                            )
+                                        }
+                                    }
+                                    isDraggingPill = false
+                                    dragOffsetPx = 0f
+                                } else if (!pressedLongEnough) {
+                                    // Released before timeout -> tap on
+                                    // whichever tab the down landed in.
+                                    val idx = (downX / cellWidthPx).toInt()
+                                        .coerceIn(0, tabs.size - 1)
+                                    onSelect(tabs[idx].route)
+                                }
+                                // If pressedLongEnough && !onPill: user
+                                // held a non-pill area for the long-press
+                                // timeout. Do nothing - that's a press
+                                // anywhere else on the bar.
+                            }
+                        },
+                ) {
+                    // ── layer 1: visual icons, captured into the
+                    // backdrop layer the capsule samples from ──────
+                    Row(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .drawWithContent {
+                                // Record icons row pixels into the
+                                // GraphicsLayer (so the capsule has
+                                // something to refract), then ALSO
+                                // draw them normally to the canvas
+                                // (so the user sees the icons outside
+                                // the capsule region).
+                                barBackdropLayer.record {
+                                    this@drawWithContent.drawContent()
+                                }
+                                drawLayer(barBackdropLayer)
+                            },
+                    ) {
                         tabs.forEach { tab ->
                             val selected = currentRoute == tab.route
                             val color =
                                 if (selected) MaterialTheme.colorScheme.primary
                                 else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
-                            // No ripple / no Material indication — the moving
-                            // glass capsule already communicates selection. A
-                            // ripple on top of the capsule looks like two
-                            // separate effects stacked.
-                            val noRippleInteraction = remember { MutableInteractionSource() }
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
-                                    .fillMaxHeight()
-                                    .clickable(
-                                        interactionSource = noRippleInteraction,
-                                        indication = null,
-                                    ) { onSelect(tab.route) },
+                                    .fillMaxHeight(),
                                 contentAlignment = Alignment.Center,
                             ) {
                                 Column(
@@ -848,9 +1045,79 @@ private fun GlassNavigationBar(
                             }
                         }
                     }
+
+                    // ── layer 2: capsule (haze effect, the lens) ─────
+                    // We always use LiquidGlassCapsule (Haze-based)
+                    // whenever glass surfaces are enabled — the separate
+                    // `liquidGlass` toggle was redundant and only made
+                    // it possible to silently end up on the old
+                    // GlassSurface code path that doesn't refract icons.
+                    //
+                    // Drag math: when the user long-presses the pill
+                    // and slides their finger horizontally we add the
+                    // raw pixel drag delta to the spring-driven index
+                    // position, clamp it so the pill never escapes
+                    // the bar, and pass that to both the offset and
+                    // the AGSL backdropOffset so the refraction
+                    // samples the correct slice of the captured icons
+                    // row in real time.
+                    val dragClampedPx = if (isDraggingPill) {
+                        val anchorPx = cellWidthPx * selectedIndex.toFloat()
+                        (anchorPx + dragOffsetPx).coerceIn(0f, maxBarPx)
+                    } else 0f
+                    val capsuleXPx = if (isDraggingPill) {
+                        dragClampedPx + capsuleInsetPx
+                    } else {
+                        cellWidthPx * animatedIndex + capsuleInsetPx
+                    }
+                    Box(
+                        modifier = Modifier
+                            .padding(vertical = capsuleInset)
+                            .offset { IntOffset(capsuleXPx.roundToInt(), 0) }
+                            .width(capsuleWidth)
+                            .fillMaxHeight()
+                            .graphicsLayer {
+                                scaleX = pillScale
+                                scaleY = pillScale
+                            },
+                    ) {
+                        if (glassOn) {
+                            com.soundcloud.lite.ui.components.LiquidGlassCapsule(
+                                modifier = Modifier.fillMaxSize(),
+                                cornerRadiusDp = 28.dp,
+                                backdropLayer = barBackdropLayer,
+                                motionAmount = pillMotion.value,
+                                backdropOffset = {
+                                    Offset(capsuleXPx, capsuleInsetPx)
+                                },
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(
+                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
+                                        shape = capsuleShape,
+                                    ),
+                            )
+                        }
+                    }
+
+                    // Layer-3 click hit-boxes removed: all gestures
+                    // are now serviced by the awaitEachGesture on the
+                    // outer bar Box (so taps anywhere on the bar
+                    // route to onSelect, and long-presses on the pill
+                    // route to drag-mode without an overlay
+                    // intercepting the down event first).
                 }
             }
 
+            // No drop shadow on the bar: with a 12 dp elevation the
+            // OS renders a dark rectangle under the GlassSurface's
+            // backdrop sampling rather than a soft glow, which read
+            // as "тёмный прямоугольник" in user testing. The
+            // floating feel now comes from the larger horizontal
+            // inset (14 dp) and the 32 dp corner radius alone.
             if (glassOn) {
                 com.soundcloud.lite.ui.components.GlassSurface(
                     modifier = Modifier.fillMaxWidth(),

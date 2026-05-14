@@ -114,14 +114,25 @@ class SoundCloudApi(
     /** Drop the cached id so the next request retries known + scrape paths. */
     fun invalidateClientId() = cachedClientId.set(null)
 
+    /**
+     * A client_id is "good" if it returns a populated /charts trending
+     * page. We deliberately don't use `/tracks?ids=...` (the old probe)
+     * because a perfectly working id can still return an empty `[]` if
+     * the hard-coded test id was deleted on SC — which is exactly what
+     * killed every probe in v0.5.0–0.5.2.
+     */
     private fun probeClientId(id: String): Boolean {
         val resp = httpGetRaw(
-            "https://api-v2.soundcloud.com/tracks?ids=1193518076&client_id=$id",
+            "https://api-v2.soundcloud.com/charts" +
+                "?kind=trending&genre=soundcloud:genres:all-music" +
+                "&limit=1&client_id=$id",
             BROWSER_UA,
         ) ?: return false
-        return !resp.contains("\"error\"") &&
-            !resp.contains("\"status\":401") &&
-            resp.contains("\"id\"")
+        // Success looks like `{"genre":"...", "kind":"trending", "collection":[ { "track": {...} } ]}`
+        // A bad client_id 404s (resp = null, handled above) or returns `{\"errors\":[...]}` / `{}`.
+        if (resp.startsWith("{}")) return false
+        if (resp.contains("\"errors\"")) return false
+        return resp.contains("\"track\"") && resp.contains("\"id\"")
     }
 
     private fun scrapeClientId(): String? {
@@ -146,25 +157,25 @@ class SoundCloudApi(
     /**
      * Resolve a playable HTTP audio URL for a SoundCloud track.
      *
-     * The `streams` endpoint returns a small JSON blob containing both
-     * progressive (`http_mp3_128_url`) and HLS (`hls_mp3_128_url`) variants
-     * plus a 30-second `preview_mp3_128_url`. We prefer progressive MP3 since
-     * ExoPlayer handles its 302 redirect to the signed CDN URL out of the
-     * box. HLS is used as a second choice — ExoPlayer's HLS source factory
-     * is wired up in [com.soundcloud.lite.player.PlaybackService]. Previews
-     * are returned with `isPreview = true` so callers can warn the user.
+     * The legacy `/tracks/{id}/streams` endpoint **is gone** — it now 404s
+     * for everyone. The working flow that the SC web player uses today is:
+     *   1. GET `/tracks?ids={id}` (or `/tracks/{id}`) — the response
+     *      includes a `media.transcodings[]` array.
+     *   2. Pick a transcoding (we prefer `progressive` over `hls`, and
+     *      anything non-`SUB_HIGH_TIER` over `SUB_HIGH_TIER` so non-Go+
+     *      requests succeed).
+     *   3. GET the transcoding's `url` with `?client_id=...` (and the
+     *      user's OAuth if they have a Go+ token saved) — the response
+     *      is `{"url": "<signed cdn url>"}`.
+     *   4. ExoPlayer can play the signed mp3 / HLS URL directly.
      */
     fun getStreamUrl(trackId: String, trackPermalink: String? = null): StreamResult? {
         if (trackId.isBlank()) {
             Log.w(TAG, "getStreamUrl called with blank trackId")
             return null
         }
-
-        // Attempt 1: api-v2 /streams with current client_id (and OAuth if set).
         val first = fetchStreamWith(trackId, useCache = true)
         if (first != null) return first
-
-        // Attempt 2: invalidate the cached id (probably stale) and retry once.
         Log.d(TAG, "First streams attempt failed for $trackId — refreshing client_id")
         invalidateClientId()
         return fetchStreamWith(trackId, useCache = false)
@@ -173,32 +184,73 @@ class SoundCloudApi(
     private fun fetchStreamWith(trackId: String, useCache: Boolean): StreamResult? {
         if (!useCache) cachedClientId.set(null)
         val cid = clientId() ?: return null
-        // Streams is the only endpoint where the user's OAuth actually
-        // unlocks something (Go+ full-length playback). Pass it via the
-        // Authorization header — which is what the SC web player uses.
-        val url = "https://api-v2.soundcloud.com/tracks/$trackId/streams?client_id=$cid"
-        val json = httpGetAuthed(url, BROWSER_UA) ?: return null
-        Log.d(TAG, "streams response for $trackId: ${json.take(200)}")
-        val mp3 = extractJsonString(json, "\"http_mp3_128_url\"")
-            ?: extractJsonString(json, "\"http_mp3_128\"")
-        if (mp3 != null) return StreamResult(mp3, false)
-        val hls = extractJsonString(json, "\"hls_mp3_128_url\"")
-            ?: extractJsonString(json, "\"hls_mp3_128\"")
-        if (hls != null) return StreamResult(hls, false)
-        val preview = extractJsonString(json, "\"preview_mp3_128_url\"")
-            ?: extractJsonString(json, "\"preview\"")
-        if (preview != null) return StreamResult(preview, true)
+        // 1. Pull the full track JSON to find the transcoding URLs.
+        val trackUrl = "https://api-v2.soundcloud.com/tracks/$trackId?client_id=$cid"
+        val trackJson = httpGetRaw(trackUrl, BROWSER_UA) ?: run {
+            lastError = "SoundCloud rejected the request for track $trackId."
+            return null
+        }
+        val transcodings = parseTranscodings(trackJson)
+        if (transcodings.isEmpty()) {
+            Log.w(TAG, "No transcodings for $trackId: ${trackJson.take(200)}")
+            lastError = "That track has no playable transcodings (private, removed, or region-blocked)."
+            return null
+        }
+        // 2. Sort: progressive > hls; within those, non-SUB_HIGH_TIER first
+        //    (Go+ exclusive). We pick the first that resolves to a real URL.
+        val sorted = transcodings.sortedWith(
+            compareBy(
+                { if (it.protocol == "progressive") 0 else 1 },
+                { if (it.quality == "sq") 0 else 1 },
+                { if (it.snippet) 1 else 0 },
+            ),
+        )
+        for (tr in sorted) {
+            val sep = if (tr.url.contains('?')) '&' else '?'
+            val resolveUrl = "${tr.url}${sep}client_id=$cid"
+            // Anonymous (client_id-only) request. Sending the user's
+            // OAuth token here would surface 401s if the token is
+            // stale, and the public progressive/HLS URLs don't need
+            // OAuth to play. Go+ exclusive transcodings will simply
+            // be skipped if anonymous resolution returns 401/403.
+            val json = httpGetRaw(resolveUrl, BROWSER_UA) ?: continue
+            val signed = extractJsonString(json, "\"url\"") ?: continue
+            Log.d(TAG, "Resolved ${tr.protocol} for $trackId (snippet=${tr.snippet})")
+            lastError = null
+            return StreamResult(signed, isPreview = tr.snippet)
+        }
+        lastError = "SoundCloud refused to sign any stream URL for this track."
         return null
+    }
+
+    private data class Transcoding(
+        val url: String,
+        val protocol: String,
+        val quality: String,
+        val snippet: Boolean,
+    )
+
+    private fun parseTranscodings(trackJson: String): List<Transcoding> {
+        val transBlock = extractJsonArrayBlock(trackJson, "\"transcodings\"") ?: return emptyList()
+        val items = splitJsonObjects(transBlock)
+        return items.mapNotNull { obj ->
+            val u = extractJsonString(obj, "\"url\"") ?: return@mapNotNull null
+            val formatBlock = extractJsonObjectBlock(obj, "\"format\"") ?: ""
+            val protocol = extractJsonString(formatBlock, "\"protocol\"") ?: "hls"
+            val quality = extractJsonString(obj, "\"quality\"") ?: "sq"
+            val snippet = obj.contains("\"snipped\":true")
+            Transcoding(u, protocol, quality, snippet)
+        }
     }
 
     // ── Trending ───────────────────────────────────────────────────────────────
 
     /**
-     * Top-50 chart. SoundCloud's `/charts` endpoint *requires* a `genre`
-     * parameter — without one the server returns 422. We pass
-     * `soundcloud:genres:all-music` by default which corresponds to the
-     * "All music genres" tab on the SC web player. Callers may override
-     * with a specific genre slug like `pop`, `electronic`, etc.
+     * Top trending tracks. SoundCloud's `/charts` endpoint **requires** a
+     * non-empty `genre` AND a `kind`. The web player uses
+     * `kind=trending` (NOT `top` — `top` 404s for every genre we've
+     * tried as of 2026). Genre is `soundcloud:genres:<slug>`; the slug
+     * must be a real SC genre slug — `all-music` is the catch-all.
      */
     fun getTrending(genre: String? = null, limit: Int = 50): List<TrackInfo> {
         val cid = clientId() ?: run {
@@ -206,15 +258,21 @@ class SoundCloudApi(
             return emptyList()
         }
         val genreSlug = genre ?: "all-music"
-        val genreParam = "&genre=soundcloud%3Agenres%3A${java.net.URLEncoder.encode(genreSlug, "UTF-8")}"
-        val url = "https://api-v2.soundcloud.com/charts?kind=top&limit=$limit$genreParam&client_id=$cid"
+        val url = "https://api-v2.soundcloud.com/charts" +
+            "?kind=trending&genre=soundcloud:genres:$genreSlug" +
+            "&limit=$limit&client_id=$cid"
         Log.d(TAG, "getTrending: $url")
         val json = httpGetRaw(url, BROWSER_UA) ?: run {
             Log.w(TAG, "getTrending: null response (network or 4xx)")
+            lastError = "Couldn't reach SoundCloud charts (network or rate-limit)."
             return emptyList()
         }
         Log.d(TAG, "getTrending response: ${json.take(300)}")
-        return parseCollection(json)
+        val parsed = parseCollection(json)
+        if (parsed.isEmpty() && json.contains("\"errors\"")) {
+            lastError = "SoundCloud rejected the trending query: ${json.take(200)}"
+        }
+        return parsed
     }
 
     fun search(query: String, limit: Int = 20, offset: Int = 0): List<TrackInfo> {
@@ -252,6 +310,16 @@ class SoundCloudApi(
 
     // ── JSON parsing ───────────────────────────────────────────────────────────
 
+    /**
+     * Parses SC's `collection: [...]` (or bare top-level array) of track
+     * entries.
+     *
+     * **Deduplicates by `providerId`**: `/charts?kind=trending` will
+     * occasionally include the same track in multiple chart positions,
+     * and `/search/tracks` can echo a track that's also surfaced via
+     * `relatedTo`. The downstream `LazyColumn` keys items by id and
+     * crashes on duplicates, so we drop them here.
+     */
     private fun parseCollection(json: String): List<TrackInfo> {
         val trimmed = json.trimStart()
         val arrStart = if (trimmed.startsWith('[')) {
@@ -268,14 +336,30 @@ class SoundCloudApi(
         val arrJson = extractJsonArray(json, arrStart) ?: return emptyList()
         val objects = splitJsonObjects(arrJson)
         Log.d(TAG, "parseCollection: ${objects.size} objects")
-        return objects.mapNotNull { parseTrack(it) }
+        return objects.mapNotNull { parseTrack(it) }.dedupById()
     }
 
     private fun parseTrackArray(json: String): List<TrackInfo> {
         val start = json.indexOf('[')
         if (start < 0) return emptyList()
         val arr = extractJsonArray(json, start) ?: return emptyList()
-        return splitJsonObjects(arr).mapNotNull { parseTrack(it) }
+        return splitJsonObjects(arr).mapNotNull { parseTrack(it) }.dedupById()
+    }
+
+    /**
+     * Drop duplicates from the SC response. `/charts` returns the same
+     * track multiple times for repeated chart positions, which crashes
+     * LazyColumn's stable-key contract downstream.
+     */
+    private fun List<TrackInfo>.dedupById(): List<TrackInfo> {
+        if (size <= 1) return this
+        val seen = HashSet<String>(size)
+        val out = ArrayList<TrackInfo>(size)
+        for (t in this) {
+            val key = if (t.providerId.isNotBlank()) t.providerId else t.id.toString()
+            if (seen.add(key)) out.add(t)
+        }
+        return out
     }
 
     private fun parseTrack(obj: String): TrackInfo? {
@@ -401,6 +485,15 @@ class SoundCloudApi(
         while (i < block.length && block[i].isWhitespace()) i++
         if (i >= block.length || block[i] != '{') return null
         return extractJsonObject(block, i)
+    }
+
+    private fun extractJsonArrayBlock(block: String, key: String): String? {
+        val idx = block.indexOf(key); if (idx < 0) return null
+        val colon = block.indexOf(':', idx + key.length); if (colon < 0) return null
+        var i = colon + 1
+        while (i < block.length && block[i].isWhitespace()) i++
+        if (i >= block.length || block[i] != '[') return null
+        return extractJsonArray(block, i)
     }
 
     private fun extractJsonObject(json: String, start: Int): String? {
