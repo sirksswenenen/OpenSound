@@ -34,8 +34,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.BlurEffect
+import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.layout.ContentScale
@@ -224,11 +227,22 @@ fun MiniPlayer(
             val miniBackdrop = rememberGraphicsLayer()
             val appBackdrop = LocalBackdropLayer.current
             val appBackdropOrigin = LocalBackdropOrigin.current
+            // SEPARATE pre-blurred copy of the app backdrop. The
+            // AGSL refraction shader inside LiquidGlassCapsule
+            // samples THIS layer (not the raw app backdrop) so
+            // when its pixels are drawn into the lens's offscreen
+            // layer they're already Gaussian-blurred by Skia's
+            // BlurEffect. We tried chaining BlurEffect+AGSL into a
+            // single RenderEffect via createChainEffect() in
+            // v0.5.8: the blur applied but the refraction
+            // disappeared entirely. Decoupling the two passes with
+            // an intermediate layer keeps both visible at once.
+            val frostedAppBackdrop = rememberGraphicsLayer()
             var miniPosInRoot by remember { mutableStateOf(Offset.Zero) }
             // Pixel-space versions of the user's blur and chroma
-            // settings, fed directly into the always-on backdrop
-            // lens so the AGSL shader frosts + RGB-splits the
-            // sampled app pixels.
+            // settings.  blurPx drives the BlurEffect on the
+            // intermediate frosted layer; chromaPx is the RGB
+            // sample offset passed into the AGSL shader.
             val density = androidx.compose.ui.platform.LocalDensity.current
             val theme0 = LocalSCTheme.current
             val blurPx = with(density) {
@@ -236,6 +250,17 @@ fun MiniPlayer(
                     .coerceAtMost(24.dp.toPx())
             }
             val chromaPx = theme0.glassChroma.coerceIn(0f, 1f) * 18f
+            // Push the user's blur into the frosted layer's
+            // renderEffect. Re-runs only when blurPx changes (the
+            // user dragged a slider in Settings) so most frames
+            // pay nothing.
+            LaunchedEffect(blurPx) {
+                frostedAppBackdrop.renderEffect = if (blurPx > 0.5f) {
+                    BlurEffect(blurPx, blurPx, TileMode.Clamp)
+                } else {
+                    null
+                }
+            }
             GlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -243,28 +268,55 @@ fun MiniPlayer(
                 shape = miniShape,
             ) {
                 Box(modifier = Modifier.fillMaxWidth()) {
+                    // Layer 1.5: invisible probe that on every
+                    // draw re-records the (sharp) app backdrop
+                    // into `frostedAppBackdrop`. Combined with
+                    // the BlurEffect we set on frostedAppBackdrop
+                    // above, every drawLayer(frostedAppBackdrop)
+                    // call further down samples the blurred copy
+                    // of the app frame instead of the sharp one.
+                    if (appBackdrop != null) {
+                        Box(
+                            modifier = Modifier
+                                .matchParentSize()
+                                .drawBehind {
+                                    val sz = appBackdrop.size
+                                    if (sz.width > 0 && sz.height > 0) {
+                                        frostedAppBackdrop.record(size = sz) {
+                                            drawLayer(appBackdrop)
+                                        }
+                                    }
+                                }
+                        )
+                    }
                     // Layer 2: always-on backdrop rim lens.
                     // Drawn UNDER the strip content so the labels
-                    // remain crisp — the refraction only shows where
+                    // remain crisp - the refraction only shows where
                     // the strip content is transparent / behind the
-                    // rounded edges of the pill. Blur and chromatic
-                    // aberration from the user's Settings are
-                    // applied to the captured pixels by chaining a
-                    // BlurEffect with the AGSL refraction shader,
-                    // and by RGB-splitting in-shader (chromaPx).
-                    // The rim band is overridden to a thin strip so
-                    // on the short mini-player the distortion stays
-                    // pinned to the edges instead of forming a wide
-                    // oval blob along the right side.
+                    // rounded edges of the pill. The lens samples
+                    // `frostedAppBackdrop` whose renderEffect is
+                    // BlurEffect(blurPx), so what reaches the AGSL
+                    // shader's `content` sampler is the blurred app
+                    // frame.  Chromatic aberration is then done
+                    // in-shader (chromaShiftPx) by RGB-splitting
+                    // along the refraction gradient.
+                    //
+                    // Rim band is overridden to a moderate width
+                    // (16 dp inward / 28 dp displacement) - wide
+                    // enough that the refraction is clearly visible
+                    // along the rounded edges, narrow enough that
+                    // on the short ~70 dp mini-player it doesn't
+                    // collapse the whole panel into one big lens
+                    // (the wide oval artifact the user reported on
+                    // v0.5.7).
                     if (appBackdrop != null) {
                         LiquidGlassCapsule(
                             modifier = Modifier.matchParentSize(),
                             cornerRadiusDp = 20.dp,
-                            backdropLayer = appBackdrop,
+                            backdropLayer = frostedAppBackdrop,
                             motionAmount = 1f,
-                            refractionHeightDpOverride = 10.dp,
-                            refractionAmountDpOverride = 14.dp,
-                            blurRadiusPx = blurPx,
+                            refractionHeightDpOverride = 16.dp,
+                            refractionAmountDpOverride = 28.dp,
                             chromaShiftPx = chromaPx,
                             backdropOffset = {
                                 Offset(
