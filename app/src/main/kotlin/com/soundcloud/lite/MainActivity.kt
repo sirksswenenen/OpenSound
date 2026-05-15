@@ -109,8 +109,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.scale
@@ -864,13 +870,24 @@ private fun GlassNavigationBar(
                 (cellWidth * (tabs.size - 1).coerceAtLeast(0)).toPx()
             }
 
+            // Capsule radius (must match capsuleShape) — read in px so we
+            // can build the same rounded-rect path both for the capsule
+            // body and for the difference-clip we apply to the icons row.
+            val capsuleRadiusPx = with(capsuleDensity) { 28.dp.toPx() }
+            val capsuleInsetPxLocal = capsuleInsetPx
+
             val barContent: @Composable () -> Unit = {
                 // The bar is rendered in two z-stacked visual layers
                 // and a single top-level gesture handler:
                 //
                 //   1. Icons row, recorded into `barBackdropLayer` AND
-                //      drawn normally. No click handlers — gestures
-                //      live on the outer pointerInput below.
+                //      drawn normally — but with the capsule's footprint
+                //      clipped out via ClipOp.Difference so the only
+                //      visible icon under the pill is the refracted
+                //      copy produced by LiquidGlassCapsule. Without
+                //      this clip we drew the original icons AND the
+                //      refraction overlay, which read as a ghost icon
+                //      sitting underneath the distortion.
                 //   2. The sliding capsule. Reads from
                 //      `barBackdropLayer` through an AGSL refraction
                 //      shader. Where it overlaps an icon, the icon is
@@ -883,6 +900,26 @@ private fun GlassNavigationBar(
                 // bounds is never stolen by a transparent click
                 // hit-box layer above it (which is what was killing
                 // the long-press in the previous build).
+                // Capsule's live position in bar-local coordinates,
+                // computed up here so we can both (a) reuse it for
+                // drawing the capsule (layer 2 below) and (b) cut the
+                // same rounded-rect out of the icons layer so the
+                // user never sees a non-refracted icon overlapping
+                // the lens. Computed inline rather than in a remember
+                // block so it tracks `animatedIndex` / `dragOffsetPx`
+                // every frame.
+                val dragClampedPxPre = if (isDraggingPill) {
+                    val anchorPx = cellWidthPx * selectedIndex.toFloat()
+                    (anchorPx + dragOffsetPx).coerceIn(0f, maxBarPx)
+                } else 0f
+                val capsuleXPxPre = if (isDraggingPill) {
+                    dragClampedPxPre + capsuleInsetPxLocal
+                } else {
+                    cellWidthPx * animatedIndex + capsuleInsetPxLocal
+                }
+                val barHeightPx = with(capsuleDensity) { barHeight.toPx() }
+                val capsuleHeightPxLocal = barHeightPx - 2f * capsuleInsetPxLocal
+
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -917,9 +954,16 @@ private fun GlassNavigationBar(
                                 // while the finger is still down on the
                                 // pill = drag begins, or (c) movement
                                 // past slop before the timeout = cancel.
-                                val pressedLongEnough = withTimeoutOrNull(
-                                    viewConfiguration.longPressTimeoutMillis,
-                                ) {
+                                //
+                                // We use a much shorter timeout (90 ms)
+                                // than the OS default (~500 ms) so the
+                                // pill becomes draggable nearly the
+                                // instant the user puts a finger on it.
+                                // Slightly longer than the touch-down
+                                // dispatch latency so a normal quick
+                                // tap (~50-70 ms typical) still
+                                // resolves as a tap, not a drag.
+                                val pressedLongEnough = withTimeoutOrNull(90L) {
                                     var result = false
                                     while (true) {
                                         val event = awaitPointerEvent()
@@ -1004,14 +1048,49 @@ private fun GlassNavigationBar(
                             .drawWithContent {
                                 // Record icons row pixels into the
                                 // GraphicsLayer (so the capsule has
-                                // something to refract), then ALSO
-                                // draw them normally to the canvas
-                                // (so the user sees the icons outside
-                                // the capsule region).
+                                // something to refract). The
+                                // recording captures the FULL row
+                                // so the AGSL shader sees a
+                                // continuous strip when it samples
+                                // for refraction.
                                 barBackdropLayer.record {
                                     this@drawWithContent.drawContent()
                                 }
-                                drawLayer(barBackdropLayer)
+                                // Now draw the icons to the actual
+                                // canvas, but cut out the area the
+                                // capsule occupies. The refracted
+                                // copy of those icons will be drawn
+                                // back by LiquidGlassCapsule on top.
+                                // The cut is scaled with `pillScale`
+                                // so during a long-press grow the
+                                // clip tracks the visibly larger pill.
+                                val sx = capsuleXPxPre
+                                val sy = capsuleInsetPxLocal
+                                val sw = capsuleWidthPx * pillScale
+                                val sh = capsuleHeightPxLocal * pillScale
+                                val cx = sx + capsuleWidthPx * 0.5f
+                                val cy = sy + capsuleHeightPxLocal * 0.5f
+                                val left = cx - sw * 0.5f
+                                val top = cy - sh * 0.5f
+                                val cutPath = Path().apply {
+                                    addRoundRect(
+                                        RoundRect(
+                                            rect = Rect(
+                                                left = left,
+                                                top = top,
+                                                right = left + sw,
+                                                bottom = top + sh,
+                                            ),
+                                            cornerRadius = CornerRadius(
+                                                capsuleRadiusPx,
+                                                capsuleRadiusPx,
+                                            ),
+                                        )
+                                    )
+                                }
+                                clipPath(cutPath, ClipOp.Difference) {
+                                    drawLayer(barBackdropLayer)
+                                }
                             },
                     ) {
                         tabs.forEach { tab ->
@@ -1061,15 +1140,10 @@ private fun GlassNavigationBar(
                     // the AGSL backdropOffset so the refraction
                     // samples the correct slice of the captured icons
                     // row in real time.
-                    val dragClampedPx = if (isDraggingPill) {
-                        val anchorPx = cellWidthPx * selectedIndex.toFloat()
-                        (anchorPx + dragOffsetPx).coerceIn(0f, maxBarPx)
-                    } else 0f
-                    val capsuleXPx = if (isDraggingPill) {
-                        dragClampedPx + capsuleInsetPx
-                    } else {
-                        cellWidthPx * animatedIndex + capsuleInsetPx
-                    }
+                    // Capsule position computed once above (capsuleXPxPre)
+                    // so the icons-layer clip and the lens overlay use
+                    // the exact same rounded-rect.
+                    val capsuleXPx = capsuleXPxPre
                     Box(
                         modifier = Modifier
                             .padding(vertical = capsuleInset)

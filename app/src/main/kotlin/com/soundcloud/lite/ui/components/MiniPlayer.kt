@@ -27,14 +27,20 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -187,28 +193,73 @@ fun MiniPlayer(
 
     when {
         glassOn && liquidOn -> {
-            // Two stacked effects:
-            //  1. GlassSurface wraps the strip - that's what actually
-            //     blurs the app pixels behind the mini-player and
-            //     applies the frosted tint. Without this wrap the
-            //     strip rendered as fully transparent on screen (no
-            //     blur, no tint), which was the regression the user
-            //     hit on v0.5.5.
-            //  2. LiquidGlassCapsule on top reads the strip's *own*
-            //     drawn content (captured into miniBackdrop) and
-            //     pushes it through the AGSL refraction shader, so
-            //     the rounded edges visibly distort artwork/labels
-            //     during the motion pulse fired on track change.
+            // Three stacked effects (in z-order, bottom → top):
+            //
+            //  1. GlassSurface wraps everything — actually blurs the
+            //     app pixels behind the mini-player, applies the
+            //     frosted tint, chromatic aberration and tilt-driven
+            //     specular reflections (all driven by user settings).
+            //     Without this wrap the strip rendered as fully
+            //     transparent on screen (v0.5.5 regression).
+            //
+            //  2. Always-on AGSL rim lens that refracts the *global*
+            //     app backdrop (LocalBackdropLayer) so whatever sits
+            //     visually behind the mini-player gets distorted at
+            //     the rounded edges, in real time, with the
+            //     blur/chroma/refraction settings the user picked
+            //     in Settings applied to the underlying frosted base.
+            //     This is what the user asked for: "refract what's
+            //     behind the mini-player, with blur/chroma from
+            //     settings affecting it". motionAmount is held at 1
+            //     so the lens is permanently visible at the rim, just
+            //     like the nav-bar pill when it's being dragged.
+            //
+            //  3. Strip content (artwork + title + controls).
+            //
+            //  4. AGSL rim lens that refracts the strip's *own*
+            //     drawn content (captured into miniBackdrop). Pulsed
+            //     by miniMotion: fires on every track change for
+            //     ~600 ms, then decays to 0 — the "wave-from-the-
+            //     track" effect the user explicitly asked to keep.
             val miniBackdrop = rememberGraphicsLayer()
+            val appBackdrop = LocalBackdropLayer.current
+            val appBackdropOrigin = LocalBackdropOrigin.current
+            var miniPosInRoot by remember { mutableStateOf(Offset.Zero) }
             GlassSurface(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onGloballyPositioned { miniPosInRoot = it.positionInRoot() },
                 shape = miniShape,
             ) {
                 Box(modifier = Modifier.fillMaxWidth()) {
-                    // Layer 1: strip content. Sized normally, so it
-                    // gives the outer Box its intrinsic height (the
-                    // capsule overlay below is matchParentSize and
-                    // would otherwise leave the Box at 0x0).
+                    // Layer 2: always-on backdrop rim lens.
+                    // Drawn UNDER the strip content so the labels
+                    // remain crisp — the refraction only shows where
+                    // the strip content is transparent / behind the
+                    // rounded edges of the pill.
+                    if (appBackdrop != null) {
+                        LiquidGlassCapsule(
+                            modifier = Modifier.matchParentSize(),
+                            cornerRadiusDp = 20.dp,
+                            backdropLayer = appBackdrop,
+                            motionAmount = 1f,
+                            backdropOffset = {
+                                Offset(
+                                    miniPosInRoot.x - appBackdropOrigin.x,
+                                    miniPosInRoot.y - appBackdropOrigin.y,
+                                )
+                            },
+                        )
+                    }
+
+                    // Layer 3: strip content, also captured into
+                    // miniBackdrop so the per-track wave (layer 4)
+                    // has something to refract. The recording lets
+                    // the wave lens see the labels/artwork; the
+                    // direct drawContent() inside record() is what
+                    // actually puts them on screen because the
+                    // miniBackdrop layer is sampled separately by
+                    // the wave overlay above.
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -218,9 +269,11 @@ fun MiniPlayer(
                             }
                     ) { content() }
 
-                    // Layer 2: the AGSL rim lens. Refracts the
-                    // captured strip pixels around the rounded edges
-                    // while motionAmount > 0.
+                    // Layer 4: the per-track wave — short pulse of
+                    // rim refraction over the strip's own captured
+                    // content (artwork + title). motionAmount
+                    // is driven by miniMotion which snaps to 1 on
+                    // track change and decays to 0 over ~600 ms.
                     LiquidGlassCapsule(
                         modifier = Modifier.matchParentSize(),
                         cornerRadiusDp = 20.dp,

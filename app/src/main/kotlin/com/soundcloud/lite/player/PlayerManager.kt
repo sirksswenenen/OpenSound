@@ -42,7 +42,13 @@ class PlayerManager(
 
     private suspend fun resolveStreamUrl(track: TrackInfo): String? =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
-            downloadRepo?.getLocalPath(track.id)?.let { return@withContext "file://$it" }
+            // Use Uri.fromFile so any odd characters in the path are
+            // properly encoded — bare "file://$path" can produce
+            // unparseable URIs that ExoPlayer rejects with no obvious
+            // error from the UI side.
+            downloadRepo?.getLocalPath(track.id)?.let { localPath ->
+                return@withContext android.net.Uri.fromFile(java.io.File(localPath)).toString()
+            }
             if (track.provider != Provider.SOUNDCLOUD) {
                 android.util.Log.w(
                     "PlayerManager",

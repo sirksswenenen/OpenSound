@@ -3,6 +3,7 @@ package com.soundcloud.lite.player
 import android.content.Intent
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -29,8 +30,14 @@ class PlaybackService : MediaSessionService() {
             .setKeepPostFor302Redirects(true)
             .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(30_000)
+        // Wrap the HTTP factory inside a DefaultDataSource so the player
+        // can also open local file:// and content:// URIs — required
+        // for downloaded tracks. Without this wrap, setDataSourceFactory
+        // replaces the default with an HTTP-only factory and tapping a
+        // downloaded track silently fails with a load error.
+        val dataSourceFactory = DefaultDataSource.Factory(applicationContext, httpFactory)
         val sourceFactory = DefaultMediaSourceFactory(applicationContext)
-            .setDataSourceFactory(httpFactory)
+            .setDataSourceFactory(dataSourceFactory)
         val player = ExoPlayer.Builder(applicationContext)
             .setMediaSourceFactory(sourceFactory)
             .setAudioAttributes(
