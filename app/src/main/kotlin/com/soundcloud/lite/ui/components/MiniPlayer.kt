@@ -225,6 +225,17 @@ fun MiniPlayer(
             val appBackdrop = LocalBackdropLayer.current
             val appBackdropOrigin = LocalBackdropOrigin.current
             var miniPosInRoot by remember { mutableStateOf(Offset.Zero) }
+            // Pixel-space versions of the user's blur and chroma
+            // settings, fed directly into the always-on backdrop
+            // lens so the AGSL shader frosts + RGB-splits the
+            // sampled app pixels.
+            val density = androidx.compose.ui.platform.LocalDensity.current
+            val theme0 = LocalSCTheme.current
+            val blurPx = with(density) {
+                (theme0.glassBlur.coerceIn(0f, 1f) * 24.dp.toPx())
+                    .coerceAtMost(24.dp.toPx())
+            }
+            val chromaPx = theme0.glassChroma.coerceIn(0f, 1f) * 18f
             GlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -236,13 +247,25 @@ fun MiniPlayer(
                     // Drawn UNDER the strip content so the labels
                     // remain crisp — the refraction only shows where
                     // the strip content is transparent / behind the
-                    // rounded edges of the pill.
+                    // rounded edges of the pill. Blur and chromatic
+                    // aberration from the user's Settings are
+                    // applied to the captured pixels by chaining a
+                    // BlurEffect with the AGSL refraction shader,
+                    // and by RGB-splitting in-shader (chromaPx).
+                    // The rim band is overridden to a thin strip so
+                    // on the short mini-player the distortion stays
+                    // pinned to the edges instead of forming a wide
+                    // oval blob along the right side.
                     if (appBackdrop != null) {
                         LiquidGlassCapsule(
                             modifier = Modifier.matchParentSize(),
                             cornerRadiusDp = 20.dp,
                             backdropLayer = appBackdrop,
                             motionAmount = 1f,
+                            refractionHeightDpOverride = 10.dp,
+                            refractionAmountDpOverride = 14.dp,
+                            blurRadiusPx = blurPx,
+                            chromaShiftPx = chromaPx,
                             backdropOffset = {
                                 Offset(
                                     miniPosInRoot.x - appBackdropOrigin.x,
