@@ -13,8 +13,8 @@ android {
         applicationId = "com.soundcloud.lite"
         minSdk = 24
         targetSdk = 34
-        versionCode = 21
-        versionName = "0.5.14"
+        versionCode = 22
+        versionName = "0.5.15"
     }
 
     signingConfigs {
