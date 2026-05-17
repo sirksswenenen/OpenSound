@@ -1,5 +1,7 @@
 package com.soundcloud.lite.api
 
+import android.util.Log
+
 /**
  * Imports a SoundCloud playlist (`/{user}/sets/{slug}`) into an in-memory
  * [ImportResult.Success]. Other services (YouTube, Spotify, etc.) were
@@ -11,10 +13,17 @@ package com.soundcloud.lite.api
  *  2. Locate the `window.__sc_hydration` block — it always carries the
  *     playlist title, artwork and the full list of track ids (some
  *     tracks come back as partial objects).
- *  3. Fan the partial ids out to `api-v2.soundcloud.com/tracks?ids=...`
- *     through [SoundCloudApi.getTracksByIds] to fetch full metadata.
+ *  3. Collect **all** track ids from that array (full + partial) in
+ *     playlist order, and fan them out to
+ *     `api-v2.soundcloud.com/tracks?ids=...` through
+ *     [SoundCloudApi.getTracksByIds] to fetch full metadata (titles,
+ *     artists, **artwork**). This is critical — SC's hydration only
+ *     embeds full data for the first ~5 tracks of a playlist, the rest
+ *     are id-only stubs, so we must always go to the API.
  *  4. JSON-LD `MusicRecording` blocks act as a last-ditch fallback when
- *     hydration is missing (rare — only seen on classic-style pages).
+ *     hydration is missing (rare — only seen on classic-style pages or
+ *     when SC briefly blocks our UA). We also pull full metadata via
+ *     the API there.
  */
 class PlaylistImporter(
     private val sc: SoundCloudApi,
@@ -39,18 +48,43 @@ class PlaylistImporter(
         val hydration = extractHydration(html)
         if (hydration != null) {
             val parsed = parseHydration(hydration)
-            if (parsed != null) {
-                val full = sc.getTracksByIds(parsed.partialIds)
-                val merged = (parsed.fullTracks + full).distinctBy { it.providerId }
-                if (merged.isNotEmpty()) return ImportResult.Success(
-                    title = parsed.title,
-                    artworkUrl = parsed.artworkUrl,
-                    tracks = merged,
-                )
+            if (parsed != null && parsed.orderedIds.isNotEmpty()) {
+                val tracks = resolveTracks(parsed.orderedIds, parsed.embeddedByPid)
+                if (tracks.isNotEmpty()) {
+                    Log.i(TAG, "import: hydration → ${tracks.size}/${parsed.orderedIds.size} tracks")
+                    return ImportResult.Success(
+                        title = parsed.title,
+                        artworkUrl = parsed.artworkUrl,
+                        tracks = tracks,
+                    )
+                }
             }
+        } else {
+            Log.w(TAG, "import: no hydration block found, falling back to JSON-LD")
         }
-        return parseJsonLd(html)
-            ?: ImportResult.Error("No playlist data found in page")
+
+        return parseJsonLd(html) ?: ImportResult.Error("No playlist data found in page")
+    }
+
+    /**
+     * Resolve a list of provider ids to full [TrackInfo]s.
+     *
+     *  - Calls the SC `tracks?ids=…` endpoint in chunks of 50 (handled
+     *    by [SoundCloudApi.getTracksByIds]).
+     *  - Preserves playlist order from [orderedIds].
+     *  - For ids the API didn't return, falls back to whatever embedded
+     *    metadata we already have (so the user at least sees a title,
+     *    even if artwork is missing for a single stubborn track).
+     */
+    private fun resolveTracks(
+        orderedIds: List<String>,
+        embeddedByPid: Map<String, TrackInfo>,
+    ): List<TrackInfo> {
+        val fromApi = sc.getTracksByIds(orderedIds).associateBy { it.providerId }
+        Log.d(TAG, "resolveTracks: ${fromApi.size}/${orderedIds.size} returned by API")
+        return orderedIds.mapNotNull { pid ->
+            fromApi[pid] ?: embeddedByPid[pid]
+        }
     }
 
     // ── Hydration ──────────────────────────────────────────────────────────────
@@ -58,14 +92,20 @@ class PlaylistImporter(
     private data class HydrationResult(
         val title: String,
         val artworkUrl: String?,
-        val fullTracks: List<TrackInfo>,
-        val partialIds: List<String>,
+        /** Track provider-ids in playlist order, deduped. */
+        val orderedIds: List<String>,
+        /** Embedded TrackInfo per provider-id (only first ~5 are full). */
+        val embeddedByPid: Map<String, TrackInfo>,
     )
 
     private fun extractHydration(html: String): String? {
-        val marker = "window.__sc_hydration = "
-        val start = html.indexOf(marker); if (start < 0) return null
-        val arrStart = html.indexOf('[', start + marker.length); if (arrStart < 0) return null
+        // Tolerate format variants:
+        //   window.__sc_hydration = [...]
+        //   window.__sc_hydration=[...]
+        //   window.__sc_hydration =[...]
+        val match = HYDRATION_RE.find(html) ?: return null
+        val arrStart = match.range.last  // position of the '[' captured by regex
+        // arrStart points to the '[' char.
         return extractArrayBlock(html, arrStart)
     }
 
@@ -82,14 +122,16 @@ class PlaylistImporter(
 
         val tracksKey = "\"tracks\":"
         val keyIdx = playlist.indexOf(tracksKey)
-        if (keyIdx < 0) return HydrationResult(title, artwork, emptyList(), emptyList())
+        if (keyIdx < 0) return HydrationResult(title, artwork, emptyList(), emptyMap())
         val arrIdx = playlist.indexOf('[', keyIdx + tracksKey.length)
-        if (arrIdx < 0) return HydrationResult(title, artwork, emptyList(), emptyList())
+        if (arrIdx < 0) return HydrationResult(title, artwork, emptyList(), emptyMap())
         val arr = extractArrayBlock(playlist, arrIdx)
-            ?: return HydrationResult(title, artwork, emptyList(), emptyList())
+            ?: return HydrationResult(title, artwork, emptyList(), emptyMap())
 
-        val full = mutableListOf<TrackInfo>()
-        val partial = mutableListOf<String>()
+        val orderedIds = mutableListOf<String>()
+        val seenIds = HashSet<String>()
+        val embedded = HashMap<String, TrackInfo>()
+
         var depth = 0; val sb = StringBuilder(); var i = 0
         var inStr = false; var esc = false
         while (i < arr.length) {
@@ -104,26 +146,35 @@ class PlaylistImporter(
                     depth--; sb.append(c)
                     if (depth == 0) {
                         val obj = sb.toString(); sb.clear()
-                        val scId = sc.extractJsonString(obj, "\"id\"") ?: extractNumber(obj, "\"id\"")
-                        val trackTitle = sc.extractJsonString(obj, "\"title\"")
-                        if (scId != null && trackTitle != null) {
-                            val user = extractObjectBlockByKey(obj, "\"user\"")
-                            val artist = if (user != null) sc.extractJsonString(user, "\"username\"") ?: "" else ""
-                            val durationMs = extractNumber(obj, "\"duration\"")?.toLongOrNull() ?: 0L
-                            val artworkRaw = sc.extractJsonString(obj, "\"artwork_url\"") ?: ""
-                            val artworkUrl = artworkRaw.takeIf { it.isNotBlank() }
-                                ?.replace("-large.", "-t500x500.")
-                            full += TrackInfo(
-                                id = SoundCloudApi.stableIdHash("sc:$scId"),
-                                providerId = scId,
-                                provider = Provider.SOUNDCLOUD,
-                                title = trackTitle,
-                                artistName = artist,
-                                artworkUrl = artworkUrl,
-                                duration = durationMs,
-                            )
-                        } else if (scId != null) {
-                            partial += scId
+                        val scId = sc.extractJsonString(obj, "\"id\"")
+                            ?: extractNumber(obj, "\"id\"")
+                        if (scId != null && seenIds.add(scId)) {
+                            orderedIds += scId
+                            // If the embedded entry happens to be a full
+                            // track (first ~5 of the playlist), preserve
+                            // a TrackInfo for it so we can fall back to
+                            // it if the API call drops this id.
+                            val trackTitle = sc.extractJsonString(obj, "\"title\"")
+                            if (!trackTitle.isNullOrBlank()) {
+                                val user = extractObjectBlockByKey(obj, "\"user\"")
+                                val artist = if (user != null)
+                                    sc.extractJsonString(user, "\"username\"") ?: ""
+                                else ""
+                                val durationMs =
+                                    extractNumber(obj, "\"duration\"")?.toLongOrNull() ?: 0L
+                                val artworkRaw = sc.extractJsonString(obj, "\"artwork_url\"") ?: ""
+                                val artworkUrl = artworkRaw.takeIf { it.isNotBlank() }
+                                    ?.replace("-large.", "-t500x500.")
+                                embedded[scId] = TrackInfo(
+                                    id = SoundCloudApi.stableIdHash("sc:$scId"),
+                                    providerId = scId,
+                                    provider = Provider.SOUNDCLOUD,
+                                    title = trackTitle,
+                                    artistName = artist,
+                                    artworkUrl = artworkUrl,
+                                    duration = durationMs,
+                                )
+                            }
                         }
                     }
                 }
@@ -131,7 +182,8 @@ class PlaylistImporter(
             }
             i++
         }
-        return HydrationResult(title, artwork, full, partial)
+        Log.d(TAG, "parseHydration: ${orderedIds.size} ids (${embedded.size} embedded full)")
+        return HydrationResult(title, artwork, orderedIds, embedded)
     }
 
     // ── JSON-LD fallback ───────────────────────────────────────────────────────
@@ -141,14 +193,28 @@ class PlaylistImporter(
         val json = match.groupValues[1]
         val name = sc.extractJsonString(json, "\"name\"") ?: "SoundCloud Playlist"
         val image = sc.extractJsonString(json, "\"image\"")
-        val tracks = SC_TRACK_BLOCK_RE.findAll(json).mapNotNull { m ->
+
+        // Pull every "soundcloud:tracks:N" id we can see, in document
+        // order. This is more robust than walking individual
+        // MusicRecording blocks (which often only list the first few).
+        val orderedIds = SC_TRACK_ID_RE.findAll(json)
+            .map { it.groupValues[1] }
+            .distinct()
+            .toList()
+        if (orderedIds.isEmpty()) return null
+
+        // Also keep the minimal embedded data we can extract as a
+        // best-effort fallback for tracks the API can't return.
+        val embedded = HashMap<String, TrackInfo>()
+        for (m in SC_TRACK_BLOCK_RE.findAll(json)) {
             val block = m.value
-            val title = sc.extractJsonString(block, "\"name\"") ?: return@mapNotNull null
             val scId = sc.extractJsonString(block, "\"@id\"")
-                ?.removePrefix("soundcloud:tracks:") ?: return@mapNotNull null
+                ?.removePrefix("soundcloud:tracks:") ?: continue
+            val title = sc.extractJsonString(block, "\"name\"") ?: continue
             val byArtistBlock = extractObjectBlockByKey(block, "\"byArtist\"")
-            val artist = if (byArtistBlock != null) sc.extractJsonString(byArtistBlock, "\"name\"") ?: "" else ""
-            TrackInfo(
+            val artist = if (byArtistBlock != null)
+                sc.extractJsonString(byArtistBlock, "\"name\"") ?: "" else ""
+            embedded[scId] = TrackInfo(
                 id = SoundCloudApi.stableIdHash("sc:$scId"),
                 providerId = scId,
                 provider = Provider.SOUNDCLOUD,
@@ -156,8 +222,11 @@ class PlaylistImporter(
                 artistName = artist,
                 isUnplayable = false,
             )
-        }.toList()
+        }
+
+        val tracks = resolveTracks(orderedIds, embedded)
         if (tracks.isEmpty()) return null
+        Log.i(TAG, "import: JSON-LD → ${tracks.size}/${orderedIds.size} tracks")
         return ImportResult.Success(title = name, artworkUrl = image, tracks = tracks)
     }
 
@@ -224,9 +293,18 @@ class PlaylistImporter(
     }
 
     private companion object {
+        private const val TAG = "PlaylistImporter"
+
         private const val BROWSER_UA =
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/124 Mobile Safari/537.36"
+
+        /**
+         * Matches `window.__sc_hydration <ws>* = <ws>* [` and anchors on
+         * the opening `[` so [extractHydration] can extract the array
+         * body via depth tracking.
+         */
+        private val HYDRATION_RE = Regex("""window\.__sc_hydration\s*=\s*\[""")
 
         private val SC_JSONLD_RE = Regex(
             """<script type="application/ld\+json">(\{.+?\})</script>""",
@@ -237,5 +315,7 @@ class PlaylistImporter(
                 """(?:[^\{\}]|\{[^\{\}]*\})*?\}""",
             RegexOption.DOT_MATCHES_ALL,
         )
+        /** Catches every `soundcloud:tracks:<id>` reference in JSON-LD. */
+        private val SC_TRACK_ID_RE = Regex("""soundcloud:tracks:(\d+)""")
     }
 }
