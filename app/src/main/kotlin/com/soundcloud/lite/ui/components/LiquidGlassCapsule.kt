@@ -64,6 +64,7 @@ uniform float4 cornerRadii;
 uniform float refractionHeight;
 uniform float refractionAmount;
 uniform float depthEffect;
+uniform float chromaShift;
 
 float radiusAt(float2 coord, float4 radii) {
     if (coord.x >= 0.0) {
@@ -115,6 +116,14 @@ half4 main(float2 coord) {
     );
 
     float2 refractedCoord = coord + d * grad;
+    if (chromaShift > 0.5) {
+        float2 chOff = grad * chromaShift;
+        half r = content.eval(refractedCoord + chOff).r;
+        half g = content.eval(refractedCoord).g;
+        half b = content.eval(refractedCoord - chOff).b;
+        half a = content.eval(refractedCoord).a;
+        return half4(r, g, b, a);
+    }
     return content.eval(refractedCoord);
 }
 """
@@ -149,6 +158,35 @@ fun LiquidGlassCapsule(
      * the underlying icons read crisply when it is at rest.
      */
     motionAmount: Float = 1f,
+    /**
+     * Override for the inward thickness of the refracting rim band.
+     * If null, derived from the user's glassBlur setting. Override
+     * to a small value on short panels (e.g. the mini-player) so
+     * the band doesn't bleed into the centre and produce a visible
+     * blob along the side.
+     */
+    refractionHeightDpOverride: androidx.compose.ui.unit.Dp? = null,
+    /**
+     * Override for the outward displacement amount of the rim
+     * refraction in pixels (before [motionAmount] is applied).
+     */
+    refractionAmountDpOverride: androidx.compose.ui.unit.Dp? = null,
+    /**
+     * Optional Gaussian blur radius applied to the captured
+     * backdrop pixels BEFORE the AGSL refraction shader sees them.
+     * Implemented as a chained [android.graphics.RenderEffect],
+     * so the blur is GPU-side and the lens stays a single offscreen
+     * pass. 0 disables blur (default).
+     */
+    blurRadiusPx: Float = 0f,
+    /**
+     * Per-channel horizontal shift in pixels for chromatic
+     * aberration along the refraction gradient. The AGSL shader
+     * samples R / G / B at staggered offsets so flat areas
+     * reconstruct the original colour but rim edges show
+     * coloured fringes. 0 disables chroma (default).
+     */
+    chromaShiftPx: Float = 0f,
 ) {
     val theme = LocalSCTheme.current
     val density = LocalDensity.current
@@ -164,10 +202,10 @@ fun LiquidGlassCapsule(
     // the icon row when the pill is in flight without affecting the
     // rest state (motion=0 still gives zero warp).
     val refractionHeightPx = with(density) {
-        (12.dp + 32.dp * refractAmount).toPx()
+        (refractionHeightDpOverride ?: (12.dp + 32.dp * refractAmount)).toPx()
     }
     val refractionAmountPx = with(density) {
-        (14.dp + 42.dp * refractAmount).toPx()
+        (refractionAmountDpOverride ?: (14.dp + 42.dp * refractAmount)).toPx()
     }
 
     val highlightStrength = (theme.glassHighlight).coerceIn(0f, 1f)
@@ -202,7 +240,14 @@ fun LiquidGlassCapsule(
     val gatedMotion = (motionAmount.coerceIn(0f, 1f) * 50f).toInt() / 50f
     val effectiveRefraction = -refractionAmountPx * gatedMotion
 
-    val renderEffect = remember(sizePx, cornerRadiusPx, refractionHeightPx, effectiveRefraction) {
+    val renderEffect = remember(
+        sizePx,
+        cornerRadiusPx,
+        refractionHeightPx,
+        effectiveRefraction,
+        blurRadiusPx,
+        chromaShiftPx,
+    ) {
         if (sizePx.width <= 0 || sizePx.height <= 0) {
             null
         } else {
@@ -221,15 +266,26 @@ fun LiquidGlassCapsule(
                 cornerRadiusPx,
             )
             shader.setFloatUniform("refractionHeight", refractionHeightPx)
-            // Shader pushes coords outwards along the gradient when
-            // `refractionAmount` is negative - matching how the
-            // upstream library invokes it. We multiply by motion
-            // so at rest the displacement is exactly 0 (no warp).
             shader.setFloatUniform("refractionAmount", effectiveRefraction)
             shader.setFloatUniform("depthEffect", 0f)
-            AndroidRenderEffect
-                .createRuntimeShaderEffect(shader, "content")
-                .asComposeRenderEffect()
+            shader.setFloatUniform("chromaShift", chromaShiftPx)
+            val agsl = AndroidRenderEffect.createRuntimeShaderEffect(shader, "content")
+            val final = if (blurRadiusPx > 0.5f) {
+                // Chain: source pixels -> Gaussian blur (inner) ->
+                // AGSL rim refraction (outer). The blur happens on
+                // the captured backdrop before the rim distortion
+                // shader sees it, so what gets refracted is the
+                // frosted version of the app behind the panel.
+                val blur = AndroidRenderEffect.createBlurEffect(
+                    blurRadiusPx,
+                    blurRadiusPx,
+                    android.graphics.Shader.TileMode.CLAMP,
+                )
+                AndroidRenderEffect.createChainEffect(agsl, blur)
+            } else {
+                agsl
+            }
+            final.asComposeRenderEffect()
         }
     }
 

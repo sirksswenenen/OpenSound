@@ -46,10 +46,18 @@ fun HomeScreen(
 ) {
     val trending by viewModel.trending.collectAsState()
     val playlists by viewModel.playlists.collectAsState()
+    val downloads by viewModel.downloads.collectAsState()
     val isLoading by viewModel.isLoadingTrending.collectAsState()
+    val personalised by viewModel.hasRecommendationSeeds.collectAsState()
     val state = rememberLazyListState()
 
-    LaunchedEffect(Unit) { viewModel.loadTrending() }
+    // Reload the feed whenever the library snapshot shifts (e.g. user
+    // downloaded a new track or added one to a playlist) so the
+    // recommendation seed set stays current. The viewModel itself
+    // dedups internally so this is cheap on no-op changes.
+    LaunchedEffect(downloads.size, playlists.sumOf { it.tracks.size }) {
+        viewModel.loadTrending()
+    }
 
     val nearEnd by remember {
         derivedStateOf {
@@ -81,9 +89,12 @@ fun HomeScreen(
             }
         }
 
-        // ---- Trending header ----
+        // ---- Trending / For-You header ----
+        // Title flips to "For You" the moment the user has at least
+        // one downloaded or playlist track - the feed underneath is
+        // already a personalised similar-tracks stream by that point.
         Text(
-            text = "Trending",
+            text = if (personalised) "For You" else "Trending",
             modifier = Modifier.padding(start = 12.dp, top = 16.dp, bottom = 8.dp),
             fontSize = 22.sp,
             fontWeight = FontWeight.SemiBold,
@@ -97,7 +108,11 @@ fun HomeScreen(
         } else if (trending.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
-                    "Couldn't load trending. Check OAuth token in Settings.",
+                    text = if (personalised) {
+                        "Couldn't load recommendations. Check OAuth token in Settings."
+                    } else {
+                        "Couldn't load trending. Check OAuth token in Settings."
+                    },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 24.dp),
                 )
@@ -114,6 +129,18 @@ fun HomeScreen(
                         track = t,
                         onClick = { viewModel.playTrack(t, trending) },
                     )
+                }
+                if (isLoading && trending.isNotEmpty()) {
+                    item("loader") {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 16.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            CircularProgressIndicator(strokeWidth = 2.dp)
+                        }
+                    }
                 }
             }
         }

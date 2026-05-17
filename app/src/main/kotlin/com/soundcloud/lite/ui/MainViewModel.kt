@@ -17,8 +17,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -62,7 +65,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val trending: StateFlow<List<TrackInfo>> = _trending.asStateFlow()
     private val _isLoadingTrending = MutableStateFlow(false)
     val isLoadingTrending: StateFlow<Boolean> = _isLoadingTrending.asStateFlow()
+    /** When non-null the legacy `/charts?kind=trending` one-shot is still
+     *  in play (e.g. user has no library and we're falling back to charts).
+     *  Set to null after the one-shot completes so we stop hammering it. */
     private var nextTrendingOffset: Int? = 0
+    /** Seed pool for the "For You" recommendation engine, built from the
+     *  user's library (downloaded tracks + tracks across all playlists).
+     *  Rebuilt on every [loadTrending] call so newly downloaded or added
+     *  tracks feed back in immediately. */
+    private var recoSeeds: List<TrackInfo> = emptyList()
+    /** Round-robin cursor into [recoSeeds]. */
+    private var nextSeedIndex: Int = 0
+    /** Ids of tracks already surfaced in the current recommendation
+     *  stream, so each `loadMoreTrending()` page returns fresh material. */
+    private val seenRecoIds: MutableSet<Long> = mutableSetOf()
+    /** Provider ids the user already has locally - we deliberately exclude
+     *  these from recommendations because there's no point recommending a
+     *  track the user already saved. */
+    private val ownedProviderIds: MutableSet<String> = mutableSetOf()
 
     private val _related = MutableStateFlow<List<TrackInfo>>(emptyList())
     val related: StateFlow<List<TrackInfo>> = _related.asStateFlow()
@@ -149,34 +169,79 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ── Trending ────────────────────────────────────────────────────────────────
+    // ── Trending / "For You" ────────────────────────────────────────────────────
+    //
+    // Behaviour:
+    //  * If the user has downloaded tracks or any playlist tracks we treat
+    //    those as "seeds" and the Home feed becomes a personalised
+    //    recommendation stream: for each page we cycle through seeds and
+    //    call SoundCloud's /tracks/{id}/related endpoint. The list grows
+    //    indefinitely as the user scrolls (round-robin over seeds).
+    //  * If the user has no library yet we fall back to the legacy
+    //    /charts?kind=trending one-shot fetch (50 tracks) so first-run
+    //    still shows content.
 
     fun loadTrending() {
+        // Reset all reco state and rebuild the seed pool from the
+        // user's current library snapshot.
         nextTrendingOffset = 0
+        nextSeedIndex = 0
+        seenRecoIds.clear()
+        ownedProviderIds.clear()
+        _trending.value = emptyList()
+
+        val downloadedTracks = downloads.value.map { it.track }
+        val playlistTracks = _playlists.value.flatMap { it.tracks }
+        val library = (downloadedTracks + playlistTracks)
+            .filter { it.provider == Provider.SOUNDCLOUD && it.providerId.isNotBlank() }
+            .distinctBy { it.providerId }
+        library.forEach { ownedProviderIds.add(it.providerId) }
+        // Bias the seed order so each session is different but the
+        // newest additions surface first - downloaded tracks lead,
+        // playlist tracks fill in, then we shuffle within those tiers.
+        recoSeeds = (
+            downloadedTracks.shuffled() + playlistTracks.shuffled()
+        )
+            .filter { it.provider == Provider.SOUNDCLOUD && it.providerId.isNotBlank() }
+            .distinctBy { it.providerId }
+
         loadMoreTrending()
     }
 
     fun loadMoreTrending() {
         if (_isLoadingTrending.value) return
-        // SC's /charts endpoint is one-shot (no paging), so we only fetch once.
-        if (nextTrendingOffset == null) return
+        if (recoSeeds.isEmpty() && nextTrendingOffset == null) return
         viewModelScope.launch {
             _isLoadingTrending.value = true
             try {
                 val tracks = withContext(Dispatchers.IO) {
-                    val genre = _playlists.value
-                        .flatMap { it.tracks }
-                        .mapNotNull { it.genre }
-                        .groupingBy { it }
-                        .eachCount()
-                        .maxByOrNull { it.value }
-                        ?.key
-                    runCatching { soundCloudApi.getTrending(genre = genre, limit = 50) }
-                        .getOrDefault(emptyList())
+                    if (recoSeeds.isNotEmpty()) {
+                        fetchRecommendationPage()
+                    } else {
+                        // No library yet: fall back to /charts trending.
+                        val genre = _playlists.value
+                            .flatMap { it.tracks }
+                            .mapNotNull { it.genre }
+                            .groupingBy { it }
+                            .eachCount()
+                            .maxByOrNull { it.value }
+                            ?.key
+                        runCatching {
+                            soundCloudApi.getTrending(genre = genre, limit = 50)
+                        }.getOrDefault(emptyList())
+                    }
                 }
                 rememberProviderIds(tracks)
-                _trending.update { tracks }
-                nextTrendingOffset = null
+                _trending.update { existing ->
+                    // Append while preserving order; dedup by numeric id
+                    // so the LazyColumn key { } doesn't crash on dupes.
+                    val seen = existing.mapTo(mutableSetOf()) { it.id }
+                    existing + tracks.filter { seen.add(it.id) }
+                }
+                if (recoSeeds.isEmpty()) {
+                    // Legacy charts is one-shot: don't refetch.
+                    nextTrendingOffset = null
+                }
             } catch (t: Throwable) {
                 _toast.value = "Trending failed: ${t.message ?: t::class.java.simpleName}"
             } finally {
@@ -184,6 +249,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+
+    /**
+     * Pull the next ~3 seeds off the round-robin and call SoundCloud's
+     * `/related` for each. Dedup against already-seen tracks AND against
+     * the user's library so we never recommend something they already
+     * downloaded / added to a playlist.
+     */
+    private suspend fun fetchRecommendationPage(): List<TrackInfo> {
+        if (recoSeeds.isEmpty()) return emptyList()
+        val seedsThisPage = 3
+        val collected = mutableListOf<TrackInfo>()
+        repeat(seedsThisPage) {
+            if (recoSeeds.isEmpty()) return@repeat
+            val seed = recoSeeds[nextSeedIndex % recoSeeds.size]
+            nextSeedIndex++
+            val related = runCatching {
+                soundCloudApi.getRelated(seed.providerId, limit = 20)
+            }.getOrDefault(emptyList())
+            for (t in related) {
+                if (t.id in seenRecoIds) continue
+                if (t.providerId.isBlank()) continue
+                if (t.providerId in ownedProviderIds) continue
+                seenRecoIds.add(t.id)
+                collected.add(t)
+            }
+        }
+        return collected
+    }
+
+    /** True when the user's library is non-empty - HomeScreen uses this to
+     *  switch the section title from "Trending" to "For You". */
+    val hasRecommendationSeeds: StateFlow<Boolean> = combine(
+        _playlists,
+        downloads,
+    ) { pl, dl ->
+        pl.any { it.tracks.isNotEmpty() } || dl.isNotEmpty()
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.Eagerly,
+        initialValue = false,
+    )
 
     // ── Related ─────────────────────────────────────────────────────────────────
 

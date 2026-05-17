@@ -82,6 +82,14 @@ fun QueueScreen(
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
 
+    // While the list is actively scrolling we lock out the
+    // horizontal swipe-to-dismiss handler. Without this, a fast
+    // flick (or even the *start* of a vertical scroll) gets caught
+    // by SwipeToDismissBox's horizontal pointer and the row
+    // animates off-screen — i.e. the track gets deleted from the
+    // queue. The lock releases as soon as the fling settles.
+    val scrollingNow = listState.isScrollInProgress
+
     val localQueue = remember { mutableStateListOf<TrackInfo>() }
     var localCurId by remember { mutableLongStateOf(-1L) }
 
@@ -162,8 +170,13 @@ fun QueueScreen(
                 val isCurrent = track.id == localCurId
                 val isThisDragging = dragState.draggingItemKey == track.id
 
+                // Raised threshold (40% → 60% of row width) so a flick
+                // from finger movement at the start of a vertical
+                // scroll doesn't cross it. Combined with the
+                // scroll-in-progress lock below this kills the
+                // "track gets deleted while I'm scrolling" bug.
                 val dismissState = rememberSwipeToDismissBoxState(
-                    positionalThreshold = { total -> total * 0.40f },
+                    positionalThreshold = { total -> total * 0.60f },
                 )
                 LaunchedEffect(dismissState.currentValue) {
                     if (dismissState.currentValue != SwipeToDismissBoxValue.Settled) {
@@ -196,8 +209,14 @@ fun QueueScreen(
                     state = if (isThisDragging)
                         rememberSwipeToDismissBoxState() else dismissState,
                     modifier = rowModifier,
-                    enableDismissFromStartToEnd = !isThisDragging,
-                    enableDismissFromEndToStart = !isThisDragging,
+                    // Disable horizontal swipe-to-dismiss while the
+                    // user is mid-drag-reorder OR while the list is
+                    // actively scrolling — in either case any
+                    // horizontal motion is almost certainly an
+                    // accidental side-effect of vertical movement
+                    // and the user does NOT want the track deleted.
+                    enableDismissFromStartToEnd = !isThisDragging && !scrollingNow,
+                    enableDismissFromEndToStart = !isThisDragging && !scrollingNow,
                     backgroundContent = {
                         val fraction = dismissState.progress.coerceIn(0f, 1f)
                         val alpha = if (!isThisDragging && fraction > 0.02f)
@@ -231,7 +250,7 @@ fun QueueScreen(
                                    else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier
                                 .padding(horizontal = 14.dp)
-                                .dragHandle(dragState, track.id),
+                                .dragHandleByKey(dragState, track.id),
                         )
                     }
                 }
@@ -279,7 +298,9 @@ private class DragDropState(
     private var autoscrollJob: Job? = null
 
     fun onStart(offsetY: Float) {
-        // Resolve which item the long-press happened on.
+        // Resolve which item the long-press happened on. `offsetY` is
+        // in the LazyColumn's local viewport coordinate space (the
+        // long-press detector is attached to the LazyColumn root).
         val info = listState.layoutInfo
         val viewportStart = info.viewportStartOffset
         val target = info.visibleItemsInfo.firstOrNull { item ->
@@ -289,6 +310,23 @@ private class DragDropState(
         } ?: return
         initial = ItemRef(target.key ?: return, target.index, target.offset, target.size)
         draggingItemKey = target.key
+        draggingItemOffset = 0f
+    }
+
+    /**
+     * Drag-handle variant: starts the reorder on a specific item
+     * identified by [key]. We canNOT use the position-based [onStart]
+     * for the drag handle because the handle's pointer-input gives us
+     * coordinates *local to the handle Icon*, which are completely
+     * unrelated to LazyColumn coordinates — so the position-based
+     * lookup always resolved to the topmost visible row, producing
+     * the "drag handle only ever moves the top track" bug.
+     */
+    fun onStartByKey(key: Any) {
+        val info = listState.layoutInfo
+        val target = info.visibleItemsInfo.firstOrNull { it.key == key } ?: return
+        initial = ItemRef(key, target.index, target.offset, target.size)
+        draggingItemKey = key
         draggingItemOffset = 0f
     }
 
@@ -392,10 +430,16 @@ private fun Modifier.dragContainer(state: DragDropState): Modifier = this.pointe
     )
 }
 
-/** Drag handle: starts immediately on press (no long-press required). */
-private fun Modifier.dragHandle(state: DragDropState, key: Any): Modifier = this.pointerInput(state, key) {
+/** Drag handle: starts immediately on press (no long-press required).
+ *  Uses the row's key directly to resolve the dragged item instead of
+ *  trying to position-hit-test the press location (the handle Icon's
+ *  pointer-input gives a local-to-handle coordinate which the
+ *  position-based logic would always interpret as the top of the
+ *  list).
+ */
+private fun Modifier.dragHandleByKey(state: DragDropState, key: Any): Modifier = this.pointerInput(state, key) {
     detectDragGestures(
-        onDragStart = { offset -> state.onStart(offset.y) },
+        onDragStart = { _ -> state.onStartByKey(key) },
         onDrag = { change, drag ->
             change.consume()
             state.onDrag(drag.y)
