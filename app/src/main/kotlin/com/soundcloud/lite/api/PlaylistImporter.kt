@@ -39,10 +39,40 @@ class PlaylistImporter(
     }
 
     fun import(url: String): ImportResult {
-        val u = url.trim().lowercase()
-        if (!u.contains("soundcloud.com/")) return ImportResult.UnsupportedUrl
+        val cleanUrl = url.trim()
+        val ulower = cleanUrl.lowercase()
+        if (!ulower.contains("soundcloud.com/")) return ImportResult.UnsupportedUrl
 
-        val html = sc.httpGetRaw(url, BROWSER_UA)
+        // Short-links like `https://on.soundcloud.com/<slug>` redirect
+        // on the HTTP layer but SC's /resolve does NOT chase redirects
+        // server-side. Expand them client-side first.
+        val canonicalUrl = if (ulower.contains("on.soundcloud.com")) {
+            sc.resolveFinalUrl(cleanUrl) ?: cleanUrl
+        } else cleanUrl
+        if (canonicalUrl != cleanUrl) {
+            Log.i(TAG, "import: short-link $cleanUrl → $canonicalUrl")
+        }
+
+        // Path 1 — the right way. api-v2 /resolve returns the *full*
+        // ordered list of track ids for the playlist (HTML hydration
+        // only embeds 5).
+        val resolved = sc.resolvePlaylist(canonicalUrl)
+        if (resolved != null) {
+            val byPid = sc.getTracksByIds(resolved.trackIds).associateBy { it.providerId }
+            val ordered = resolved.trackIds.mapNotNull { byPid[it] }
+            if (ordered.isNotEmpty()) {
+                Log.i(TAG, "import: /resolve → ${ordered.size}/${resolved.trackIds.size} tracks")
+                return ImportResult.Success(
+                    title = resolved.title,
+                    artworkUrl = resolved.artworkUrl,
+                    tracks = ordered,
+                )
+            }
+            Log.w(TAG, "import: /resolve gave ${resolved.trackIds.size} ids but /tracks?ids= returned 0")
+        }
+
+        // Path 2 — HTML hydration fallback (older SC layouts).
+        val html = sc.httpGetRaw(canonicalUrl, BROWSER_UA)
             ?: return ImportResult.Error("Couldn't fetch playlist page")
 
         val hydration = extractHydration(html)
@@ -63,6 +93,7 @@ class PlaylistImporter(
             Log.w(TAG, "import: no hydration block found, falling back to JSON-LD")
         }
 
+        // Path 3 — JSON-LD fallback (last-ditch, classic-style pages).
         return parseJsonLd(html) ?: ImportResult.Error("No playlist data found in page")
     }
 

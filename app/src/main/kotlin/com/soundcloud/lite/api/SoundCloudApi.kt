@@ -3,8 +3,21 @@ package com.soundcloud.lite.api
 import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * Minimal projection of an SC `/resolve` response for a playlist:
+ * the title and cover art for the playlist itself, plus the ordered
+ * list of track ids (which the caller is expected to fan out via
+ * [SoundCloudApi.getTracksByIds] to retrieve full per-track metadata).
+ */
+data class ResolvedPlaylist(
+    val title: String,
+    val artworkUrl: String?,
+    val trackIds: List<String>,
+)
 
 /**
  * Thin wrapper around SoundCloud's public `api-v2` endpoints. We never use
@@ -293,6 +306,60 @@ class SoundCloudApi(
             BROWSER_UA,
         ) ?: return emptyList()
         return parseCollection(json)
+    }
+
+    /**
+     * Follow HTTP redirects for [url] and return the final destination
+     * URL (or null on error). Used to expand SC short-links like
+     * `https://on.soundcloud.com/<slug>` into the canonical
+     * `https://soundcloud.com/<user>/sets/<slug>` URL before passing
+     * them to [resolvePlaylist] (SC's `/resolve` endpoint does NOT
+     * follow short-link redirects server-side).
+     */
+    fun resolveFinalUrl(url: String, ua: String = BROWSER_UA): String? = try {
+        val req = Request.Builder().url(url).header("User-Agent", ua).build()
+        http.newCall(req).execute().use { r ->
+            if (r.isSuccessful) r.request.url.toString() else null
+        }
+    } catch (e: Exception) {
+        Log.e(TAG, "resolveFinalUrl error for $url: $e")
+        null
+    }
+
+    /**
+     * Look up a SoundCloud playlist by its canonical URL through the
+     * official `api-v2.soundcloud.com/resolve` endpoint. Unlike the
+     * HTML hydration block (which only embeds the first ~5 tracks of a
+     * playlist), `/resolve` returns the **full** ordered `tracks`
+     * array as id-only stubs, so callers can then fan out to
+     * [getTracksByIds] to retrieve full metadata + artwork.
+     *
+     * Returns null if there's no client id, the request fails, or the
+     * response is not a playlist (e.g. caller pointed it at a track URL).
+     */
+    fun resolvePlaylist(url: String): ResolvedPlaylist? {
+        val cid = clientId() ?: return null
+        val encoded = URLEncoder.encode(url, "UTF-8")
+        val apiUrl = "https://api-v2.soundcloud.com/resolve?url=$encoded&client_id=$cid"
+        val json = httpGetRaw(apiUrl, BROWSER_UA) ?: run {
+            Log.w(TAG, "resolvePlaylist: HTTP failed for $url")
+            return null
+        }
+        val tracksArr = extractJsonArrayBlock(json, "\"tracks\"") ?: run {
+            Log.w(TAG, "resolvePlaylist: no \"tracks\" array in /resolve response for $url")
+            return null
+        }
+        val objects = splitJsonObjects(tracksArr)
+        val ids = objects.mapNotNull { extractJsonNumber(it, "\"id\"") }
+        if (ids.isEmpty()) {
+            Log.w(TAG, "resolvePlaylist: tracks[] present but no ids extractable")
+            return null
+        }
+        val title = extractJsonString(json, "\"title\"") ?: "SoundCloud Playlist"
+        val artwork = extractJsonString(json, "\"artwork_url\"")
+            ?.replace("-large.", "-t500x500.")
+        Log.i(TAG, "resolvePlaylist: $url → ${ids.size} tracks, title='$title'")
+        return ResolvedPlaylist(title, artwork, ids)
     }
 
     /** Look up full track metadata for a list of numeric SC ids. */
