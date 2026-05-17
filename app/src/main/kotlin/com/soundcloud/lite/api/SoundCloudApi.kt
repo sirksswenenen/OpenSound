@@ -309,22 +309,44 @@ class SoundCloudApi(
     }
 
     /**
-     * Follow HTTP redirects for [url] and return the final destination
-     * URL (or null on error). Used to expand SC short-links like
-     * `https://on.soundcloud.com/<slug>` into the canonical
-     * `https://soundcloud.com/<user>/sets/<slug>` URL before passing
-     * them to [resolvePlaylist] (SC's `/resolve` endpoint does NOT
-     * follow short-link redirects server-side).
+     * Follow HTTP redirects for [url] and return the **canonical**
+     * desktop SoundCloud URL (or null on error). Used to expand
+     * SC short-links like `https://on.soundcloud.com/<slug>` into
+     * `https://soundcloud.com/<user>/sets/<slug>` before passing them
+     * to [resolvePlaylist] — SC's `/resolve` endpoint does not chase
+     * short-link redirects server-side, and (critically) rejects
+     * `m.soundcloud.com` hosts with an empty `{}` payload.
+     *
+     * The redirect chain is followed with a **desktop** UA because
+     * SC bounces Android-Chrome UAs through `m.soundcloud.com` on
+     * the final hop, which would otherwise leak into the URL we
+     * hand to /resolve. We also strip tracking query params from
+     * the final URL since they're never needed by /resolve and
+     * could mask the canonical form.
      */
-    fun resolveFinalUrl(url: String, ua: String = BROWSER_UA): String? = try {
-        val req = Request.Builder().url(url).header("User-Agent", ua).build()
+    fun resolveFinalUrl(url: String): String? = try {
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", DESKTOP_BROWSER_UA)
+            .build()
         http.newCall(req).execute().use { r ->
-            if (r.isSuccessful) r.request.url.toString() else null
+            if (r.isSuccessful) normalizeSoundCloudUrl(r.request.url.toString()) else null
         }
     } catch (e: Exception) {
         Log.e(TAG, "resolveFinalUrl error for $url: $e")
         null
     }
+
+    /**
+     * Drop tracking query params and force the desktop SC host so
+     * `/resolve` recognizes the URL. Safe to call on any soundcloud
+     * URL — input that's already canonical passes through with only
+     * the `?…` tail removed.
+     */
+    private fun normalizeSoundCloudUrl(url: String): String =
+        url.substringBefore('?')
+            .replace("://m.soundcloud.com", "://soundcloud.com")
+            .replace("://www.soundcloud.com", "://soundcloud.com")
 
     /**
      * Look up a SoundCloud playlist by its canonical URL through the
@@ -621,6 +643,16 @@ class SoundCloudApi(
         private const val BROWSER_UA =
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Mobile Safari/537.36"
+
+        /**
+         * Desktop variant used only when we need a redirect chain to
+         * end on `soundcloud.com` instead of `m.soundcloud.com`
+         * (which `api-v2 /resolve` doesn't recognize). Specifically
+         * used in [resolveFinalUrl] for short-links.
+         */
+        private const val DESKTOP_BROWSER_UA =
+            "Mozilla/5.0 (X11; Linux x86_64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 
         /**
          * Snapshots of SoundCloud's public anonymous `client_id`, in

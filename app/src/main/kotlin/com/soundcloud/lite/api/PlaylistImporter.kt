@@ -45,12 +45,17 @@ class PlaylistImporter(
 
         // Short-links like `https://on.soundcloud.com/<slug>` redirect
         // on the HTTP layer but SC's /resolve does NOT chase redirects
-        // server-side. Expand them client-side first.
-        val canonicalUrl = if (ulower.contains("on.soundcloud.com")) {
-            sc.resolveFinalUrl(cleanUrl) ?: cleanUrl
-        } else cleanUrl
+        // server-side, AND its android-UA redirect ends on
+        // `m.soundcloud.com` which /resolve also doesn't accept.
+        // resolveFinalUrl uses a desktop UA and normalizes the host +
+        // query so the canonical URL is always something /resolve
+        // recognizes. We pass through *every* SC URL (not just short
+        // links) because users may also paste `m.soundcloud.com/...`
+        // URLs or canonical URLs with tracking `?ref=clipboard&...`
+        // suffixes — both of which would otherwise mis-route.
+        val canonicalUrl = sc.resolveFinalUrl(cleanUrl) ?: cleanUrl
         if (canonicalUrl != cleanUrl) {
-            Log.i(TAG, "import: short-link $cleanUrl → $canonicalUrl")
+            Log.i(TAG, "import: normalized $cleanUrl → $canonicalUrl")
         }
 
         // Path 1 — the right way. api-v2 /resolve returns the *full*
